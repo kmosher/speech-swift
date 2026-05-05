@@ -34,6 +34,7 @@ Converts raw audio to a mel spectrogram `[128, T]` using Accelerate framework.
 - Causal mask: `nil` for autoregressive steps (seqLen=1), broadcast for prefill
 - **Prefill** (seqLen > 1): all prompt tokens in one forward pass
 - **Decode** (seqLen = 1): SDPA uses optimized T_q=1 Metal kernel
+- **Greedy fast path** (default options): decode loop is double-buffered via `MLX.asyncEval` — step N+1's forward pass is queued *before* step N's token syncs to CPU, so host-side EOS check and append overlap with GPU work. Bit-identical to the legacy loop (snapshot-tested); ~5 % faster on long-form audio (1.7B-8bit, 71 s clip)
 
 ## Decoder Options
 
@@ -49,9 +50,10 @@ struct that exposes the HuggingFace-style decoding knobs:
 | `noRepeatNgramSize` | `0` | Masks tokens that would form a repeated n-gram of this size. `0` disables. |
 | `temperature` | `0.0` | `0` = greedy (argmax). `> 0` = sample via Gumbel-max (`argmax(logits/T + Gumbel(0,1)) ~ softmax(logits/T)`). |
 
-All defaults preserve the legacy greedy path byte-for-byte via a fast-path
-that bypasses logit manipulation when `repetitionPenalty == 1.0 &&
-noRepeatNgramSize == 0 && temperature == 0`.
+All defaults take the asyncEval greedy fast path described above; any
+non-default option falls back to a per-token-sync loop because the
+sampler pulls full logits to CPU and defeats the overlap. Output is
+byte-identical to the legacy loop in either mode.
 
 The canonical defence against "percent percent percent..." loops on silence
 or ambiguous audio is `repetitionPenalty = 1.15`:
