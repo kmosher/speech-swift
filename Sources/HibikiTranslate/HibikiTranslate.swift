@@ -189,14 +189,35 @@ public extension HibikiTranslateModel {
         }
 
         // 4. Decode target codebooks via Mimi → English audio.
+        //
+        // CRITICAL: align codebooks by their per-stream delay before decoding.
+        // Upstream Moshi `_step` returns codes via `cache.gather(index = (offset
+        // - max_delay + delays[k]) % CT)` (lm.py line 778-780). For Hibiki Zero
+        // with delays = [text=0, target_cb0=0, target_cb1..15=2], this means
+        // the time-T audio frame is composed of:
+        //   - cb0 from generation step T
+        //   - cb1..15 from generation step T + 2
+        // Without this un-shift, cb1..15 would be 2 frames stale relative to
+        // cb0, garbling Mimi's reconstruction. PersonaPlex (max_delay=1) is
+        // less affected by skipping the un-shift; Hibiki (max_delay=2) is more
+        // sensitive.
         let decStart = CFAbsoluteTimeGetCurrent()
-        let numFrames = targetTokens[0].count
-        guard numFrames > 0 else { return ([], allTextTokens) }
+        let totalGenSteps = targetTokens[0].count
+        let alignedFrames = totalGenSteps - maxDelay   // skip max_delay warm-up
+        guard alignedFrames > 0 else { return ([], allTextTokens) }
 
+        // Per-codebook delays for the target half (streams 1..nQ).
+        // delays[1 + cb] gives the delay of target codebook cb.
         var flat: [Int32] = []
-        flat.reserveCapacity(nQ * numFrames)
-        for cb in 0..<nQ { flat.append(contentsOf: targetTokens[cb]) }
-        let codesArr = MLXArray(flat).reshaped([1, nQ, numFrames])
+        flat.reserveCapacity(nQ * alignedFrames)
+        for cb in 0..<nQ {
+            let delay = delays[1 + cb]
+            for t in 0..<alignedFrames {
+                let srcStep = t + delay
+                flat.append(targetTokens[cb][srcStep])
+            }
+        }
+        let codesArr = MLXArray(flat).reshaped([1, nQ, alignedFrames])
         let decoded = mimi.decode(codesArr)   // [1, 1, samples]
         eval(decoded)
 
