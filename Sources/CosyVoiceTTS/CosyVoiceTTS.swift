@@ -180,6 +180,8 @@ public final class CosyVoiceTTSModel {
         language: String = "english",
         instruction: String = "You are a helpful assistant.",
         speakerEmbedding: [Float]? = nil,
+        promptToken: MLXArray? = nil,
+        promptFeat: MLXArray? = nil,
         verbose: Bool = false
     ) -> [Float] {
         // 1. Tokenize text via Qwen2.5 BPE tokenizer
@@ -202,19 +204,39 @@ public final class CosyVoiceTTSModel {
             return []
         }
 
-        // 3. Convert speech tokens to mel spectrogram via flow matching
+        // 3. Convert speech tokens to mel spectrogram via flow matching.
+        //    When promptToken + promptFeat are supplied (the upstream zero-shot
+        //    cloning path), the flow returns mel for the *full* prompt + generation
+        //    span; we slice off the prompt region before HiFi-GAN.
         t0 = CFAbsoluteTimeGetCurrent()
         let tokenArray = MLXArray(speechTokens).expandedDimensions(axis: 0)  // [1, T]
-        let mel: MLXArray
-        if let embedding = speakerEmbedding {
-            let spkEmb = MLXArray(embedding).expandedDimensions(axis: 0)  // [1, 192]
-            mel = flow(tokens: tokenArray, spkEmbedding: spkEmb)
-        } else {
-            mel = flow(tokens: tokenArray)
+        let spkEmb: MLXArray? = speakerEmbedding.map {
+            MLXArray($0).expandedDimensions(axis: 0)
         }
-        eval(mel)
+        let fullMel = flow(
+            tokens: tokenArray,
+            spkEmbedding: spkEmb,
+            promptToken: promptToken,
+            promptFeat: promptFeat
+        )
+        eval(fullMel)
+
+        // Slice off the prompt-region mel frames so HiFi-GAN only synthesizes
+        // the new content. Upstream does this after the flow forward pass too.
+        let mel: MLXArray
+        if let pf = promptFeat {
+            let promptMelLen = pf.dim(2)
+            mel = fullMel[0..., 0..., promptMelLen...]
+        } else {
+            mel = fullMel
+        }
+
         if verbose {
-            let suffix = speakerEmbedding != nil ? " (speaker-conditioned)" : ""
+            var path: [String] = []
+            if speakerEmbedding != nil { path.append("spk") }
+            if promptToken != nil { path.append("prompt_token") }
+            if promptFeat != nil { path.append("prompt_feat") }
+            let suffix = path.isEmpty ? "" : " (\(path.joined(separator: "+")))"
             print(String(format: "  Flow: %.0fms%@", (CFAbsoluteTimeGetCurrent() - t0) * 1000, suffix))
         }
 
