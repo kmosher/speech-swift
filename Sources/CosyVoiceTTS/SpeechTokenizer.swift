@@ -313,4 +313,12 @@ public final class SpeechTokenizerModel: Module {
         let hidden = encoder(mel)              // [B, T/4, n_state]
         return quantizer.encode(hidden)         // [B, T/4]
     }
+
+    /// Load weights from `speech_tokenizer.safetensors` produced by the conversion
+    /// script. Pure convenience over `CosyVoiceWeightLoader.loadSpeechTokenizer`.
+    public static func fromSafetensors(at url: URL) throws -> SpeechTokenizerModel {
+        let model = SpeechTokenizerModel()
+        try CosyVoiceWeightLoader.loadSpeechTokenizer(model, from: url)
+        return model
+    }
 }

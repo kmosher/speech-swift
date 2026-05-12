@@ -89,6 +89,9 @@ public struct SpeakCommand: ParsableCommand {
     @Option(name: .long, help: "[cosyvoice] MLXRandom seed applied before each synthesis call. Fixes the flow-matching noise + Gumbel sampling + HiFiGAN init phase, so repeated calls with the same speaker embedding produce near-identical prosody and timbre across sections. Useful for long-form narration cut into chunks.")
     public var seed: UInt64?
 
+    @Option(name: .long, help: "[cosyvoice] Path to speech_tokenizer.safetensors (S3-Tokenizer-v3). When supplied, --voice-sample is upgraded from spk-only cloning (cos~0.83 cap) to upstream zero-shot conditioning with prompt_token + prompt_feat (preserves identity through emotion changes). Auto-detected in the bundle's cache dir if omitted.")
+    public var cosySpeechTokenizer: String?
+
     @Flag(name: .long, help: "Show detailed timing info")
     public var verbose: Bool = false
 
@@ -417,21 +420,54 @@ public struct SpeakCommand: ParsableCommand {
             // Load speaker embeddings from voice samples
             var speakerEmbeddings: [String: [Float]] = [:]
             #if canImport(CoreML)
-            // Single --voice-sample (no --speakers) → used as default embedding
+            // Single --voice-sample (no --speakers) → used as default embedding.
+            // When `speech_tokenizer.safetensors` is present in the bundle we
+            // also extract the upstream zero-shot conditioning (prompt_token +
+            // prompt_feat) and stash it in `defaultVoiceProfile`. The single-
+            // segment synthesis path below picks the profile up automatically.
             var defaultEmbedding: [Float]?
+            var defaultVoiceProfile: CosyVoiceVoiceProfile?
             if let voiceSamplePath = voiceSample, speakerFiles.isEmpty {
                 let refURL = URL(fileURLWithPath: voiceSamplePath)
-                let refSamples = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
-                print("  Reference audio: \(refSamples.count) samples (\(String(format: "%.1f", Double(refSamples.count) / 16000.0))s)")
+                let refSamples16k = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
+                print("  Reference audio: \(refSamples16k.count) samples (\(String(format: "%.1f", Double(refSamples16k.count) / 16000.0))s)")
 
                 print("Loading CAM++ speaker encoder...")
                 let campp = try await CamPlusPlusSpeaker.fromPretrained { progress, status in
                     reportProgress(progress, status)
                 }
 
-                let embedding = try campp.embed(audio: refSamples, sampleRate: 16000)
+                let embedding = try campp.embed(audio: refSamples16k, sampleRate: 16000)
                 defaultEmbedding = embedding
                 print("  Speaker embedding: \(embedding.count)-dim")
+
+                // Look for the S3 speech tokenizer alongside the other bundle
+                // files. If it's there, build a full voice profile (prompt_token
+                // + prompt_feat + speaker embedding) so the flow gets per-frame
+                // reference conditioning. Bundles produced before this change
+                // won't have the file — we fall back to the spk-only path with
+                // a warning so the operator knows why cloning quality is capped.
+                let cacheDir = try HuggingFaceDownloader.getCacheDirectory(for: modelId)
+                let tokURL = cosySpeechTokenizer.map { URL(fileURLWithPath: $0) }
+                    ?? cacheDir.appendingPathComponent("speech_tokenizer.safetensors")
+                if FileManager.default.fileExists(atPath: tokURL.path) {
+                    print("Loading speech tokenizer (\(tokURL.lastPathComponent))...")
+                    let tokenizer = try SpeechTokenizerModel.fromSafetensors(at: tokURL)
+                    print("  Extracting voice profile (prompt_token + prompt_feat)...")
+                    defaultVoiceProfile = try cosyModel.extractVoiceProfile(
+                        audio: refSamples16k,
+                        sampleRate: 16000,
+                        speechTokenizer: tokenizer
+                    )
+                    if let p = defaultVoiceProfile {
+                        let tokLen = p.promptToken?.dim(1) ?? 0
+                        let mel50Hz = p.promptFeat?.dim(2) ?? 0
+                        print("  Voice profile: \(tokLen) prompt tokens (25 Hz), \(mel50Hz) mel frames (50 Hz)")
+                    }
+                } else {
+                    print("  No speech_tokenizer.safetensors in bundle — falling back to spk-only cloning (cap ≈ cos 0.83).")
+                    print("    Re-export the bundle with `convert_speech_tokenizer` (speech-models) to enable.")
+                }
             }
 
             // Multi-speaker: load CAM++ once, extract embedding per speaker file
@@ -451,6 +487,7 @@ public struct SpeakCommand: ParsableCommand {
             }
             #else
             let defaultEmbedding: [Float]? = nil
+            let defaultVoiceProfile: CosyVoiceVoiceProfile? = nil
             #endif
 
             // Parse dialogue segments
@@ -557,16 +594,31 @@ public struct SpeakCommand: ParsableCommand {
                 } ?? defaultInstruction
 
                 var info = "Synthesizing: \"\(inputText)\""
-                if defaultEmbedding != nil || !speakerEmbeddings.isEmpty { info += " [voice clone]" }
+                if defaultVoiceProfile != nil {
+                    info += " [voice clone: prompt_token + prompt_feat]"
+                } else if defaultEmbedding != nil || !speakerEmbeddings.isEmpty {
+                    info += " [voice clone: spk-only]"
+                }
                 if instruction != "You are a helpful assistant." { info += " [instruction: \(instruction)]" }
                 print(info)
 
-                let samples = cosyModel.synthesize(
-                    text: inputText, language: effectiveLanguage,
-                    instruction: instruction,
-                    speakerEmbedding: defaultEmbedding,
-                    verbose: verbose
-                )
+                let samples: [Float]
+                if let profile = defaultVoiceProfile {
+                    samples = cosyModel.synthesize(
+                        text: inputText,
+                        voiceProfile: profile,
+                        language: effectiveLanguage,
+                        instruction: instruction,
+                        verbose: verbose
+                    )
+                } else {
+                    samples = cosyModel.synthesize(
+                        text: inputText, language: effectiveLanguage,
+                        instruction: instruction,
+                        speakerEmbedding: defaultEmbedding,
+                        verbose: verbose
+                    )
+                }
 
                 let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                 let duration = Double(samples.count) / 24000.0
