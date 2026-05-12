@@ -191,22 +191,20 @@ public final class CosyVoiceTTSModel {
         //    instruction. Upstream: `min_len = (text_len - prompt_text_len) * ratio`.
         let contentTokens = tokenizer.encode(text).map { Int32($0) }
 
-        // For zero-shot voice cloning: when a reference transcript is supplied,
-        // upstream's frontend constructs the LLM text input as
-        //   text = concat(prompt_text_tokens, content_text_tokens)
-        // so the LLM knows what the prompt_speech_token region linguistically
-        // represents. Without it the LLM has acoustic context but no idea what
-        // was said, and emits content-incorrect speech in the right voice.
-        // We splice the transcript through the same `tokenizeText` system-frame
-        // path: the transcript replaces the instruction string, so the final
-        // text token sequence is "You are a helpful assistant. <transcript><|endofprompt|><content>".
-        let effectiveInstruction: String
+        // For zero-shot voice cloning, upstream's text input is literally
+        //   concat(transcript_tokens + [<|endofprompt|>], content_tokens)
+        // with NO "You are a helpful assistant. " system frame. Adding the
+        // system frame puts the LLM off the training distribution and it
+        // reads back the tail of the transcript instead of synthesising the
+        // user text. So when promptText is set we bypass tokenizeText entirely
+        // and build the sequence directly.
+        let textTokens: [Int32]
         if let pt = promptText, !pt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            effectiveInstruction = pt
+            let promptTextTokens = tokenizer.encode(pt).map { Int32($0) }
+            textTokens = promptTextTokens + [Self.endOfPromptToken] + contentTokens
         } else {
-            effectiveInstruction = instruction
+            textTokens = tokenizeText(text, language: language, instruction: instruction)
         }
-        let textTokens = tokenizeText(text, language: language, instruction: effectiveInstruction)
 
         // 2. Generate speech tokens via LLM.
         //    For zero-shot cloning, the reference's FSQ codes are passed as
