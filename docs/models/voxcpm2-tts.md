@@ -1,6 +1,6 @@
 # VoxCPM2 - Tokenizer-Free Multilingual TTS
 
-> Reference for the Swift MLX port. Based on [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) and the Apple Silicon MLX port [mlx-community/VoxCPM2-bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16).
+> Reference for the Swift MLX port. Converted from [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) into [aufklarer/VoxCPM2-MLX-{bf16,int8,int4}](https://huggingface.co/aufklarer).
 
 ## Overview
 
@@ -78,7 +78,7 @@ The current Swift implementation follows the upstream VoxCPM2 control tokens:
 
 ## Swift Implementation Notes
 
-- `VoxCPM2TTSModel.fromPretrained()` defaults to `mlx-community/VoxCPM2-bf16`
+- `VoxCPM2TTSModel.fromPretrained()` defaults to `aufklarer/VoxCPM2-MLX-bf16`
 - `generateVoxCPM2(...)` accepts optional `refAudio`, `promptAudio`, `promptText`, and `instruct`
 - `language` is accepted for protocol compatibility, but the upstream model auto-detects supported languages
 - `AudioVAE` and the LocDiT stack are loaded from the same model directory as the base LM weights
@@ -87,8 +87,11 @@ The current Swift implementation follows the upstream VoxCPM2 control tokens:
 
 | Bundle | Format | Notes |
 |---|---|---|
-| `openbmb/VoxCPM2` | PyTorch / HF | Upstream reference model |
-| `mlx-community/VoxCPM2-bf16` | MLX / safetensors | Native Apple Silicon port |
+| `openbmb/VoxCPM2` | PyTorch / HF | Upstream reference model (conversion source) |
+| `aufklarer/VoxCPM2-MLX-bf16` | MLX / safetensors | Full-precision Apple Silicon port (default) |
+| `aufklarer/VoxCPM2-MLX-int8` | MLX / safetensors | 8-bit group quantization, ~3 GB |
+| `aufklarer/VoxCPM2-MLX-int4` | MLX / safetensors | 4-bit group quantization, ~1.9 GB |
+
 
 ## Source Files
 
@@ -103,5 +106,4 @@ Sources/VoxCPM2TTS/
 ## Official Sources
 
 - [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)
-- [mlx-community/VoxCPM2-bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16)
 - [OpenBMB VoxCPM repository](https://github.com/OpenBMB/VoxCPM)

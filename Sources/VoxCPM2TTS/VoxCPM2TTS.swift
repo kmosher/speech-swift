@@ -103,7 +103,7 @@ public final class VoxCPM2TTSModel: Module {
     // MARK: - Loading
 
     public static func fromPretrained(
-        modelId: String = "mlx-community/VoxCPM2-bf16",
+        modelId: String = "aufklarer/VoxCPM2-MLX-bf16",
         cacheDir: URL? = nil,
         offlineMode: Bool = false,
         progressHandler: ((Double, String) -> Void)? = nil

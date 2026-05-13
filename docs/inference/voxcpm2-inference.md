@@ -49,7 +49,8 @@ speech speak "This is an ultimate cloning demo." \
 
 | Flag | Purpose |
 |---|---|
-| `--voxcpm2-model-id` | Hugging Face model ID, defaults to `mlx-community/VoxCPM2-bf16` |
+| `--voxcpm2-variant` | Quantization variant: `bf16` (default), `int8`, `int4`. Resolves to `aufklarer/VoxCPM2-MLX-<variant>`. |
+| `--voxcpm2-model-id` | Full Hugging Face model ID, overrides `--voxcpm2-variant`. |
 | `--voxcpm2-instruct` | Style instruction for voice design |
 | `--voxcpm2-ref-audio` | Reference audio for cloning |
 | `--voxcpm2-prompt-audio` | Prompt audio for continuation |
@@ -81,7 +82,7 @@ let refSamples = try AudioFileLoader.load(url: refURL, targetSampleRate: 16000)
 let promptSamples = try AudioFileLoader.load(url: promptURL, targetSampleRate: 16000)
 
 let model = try await VoxCPM2TTSModel.fromPretrained(
-    modelId: "mlx-community/VoxCPM2-bf16"
+    modelId: "aufklarer/VoxCPM2-MLX-bf16"
 )
 
 let audio = try await model.generateVoxCPM2(
