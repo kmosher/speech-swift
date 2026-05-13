@@ -50,7 +50,6 @@ speech speak "This is an ultimate cloning demo." \
 | Flag | Purpose |
 |---|---|
 | `--voxcpm2-variant` | Quantization variant: `bf16` (default), `int8`, `int4`. Resolves to `aufklarer/VoxCPM2-MLX-<variant>`. |
-| `--voxcpm2-model-id` | Full Hugging Face model ID, overrides `--voxcpm2-variant`. |
 | `--voxcpm2-instruct` | Style instruction for voice design |
 | `--voxcpm2-ref-audio` | Reference audio for cloning |
 | `--voxcpm2-prompt-audio` | Prompt audio for continuation |

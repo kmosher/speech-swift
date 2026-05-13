@@ -4,20 +4,19 @@ import ArgumentParser
 import MLX
 import Qwen3TTS
 import CosyVoiceTTS
-import Qwen3TTSCoreML
 import VoxCPM2TTS
 import AudioCommon
 
 public struct SpeakCommand: ParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "speak",
-        abstract: "Text-to-speech synthesis (Qwen3-TTS, CosyVoice, VoxCPM2, or CoreML)"
+        abstract: "Text-to-speech synthesis (Qwen3-TTS, CosyVoice, or VoxCPM2). For CoreML, use the `qwen3-tts-coreml` subcommand."
     )
 
     @Argument(help: "Text to synthesize (omit when using --list-speakers or --batch-file)")
     public var text: String?
 
-    @Option(name: .long, help: "TTS engine: qwen3 (default), cosyvoice, coreml, or voxcpm2")
+    @Option(name: .long, help: "TTS engine: qwen3 (default), cosyvoice, or voxcpm2")
     public var engine: String = "qwen3"
 
     @Option(name: .shortAndLong, help: "Output WAV file path")
@@ -101,11 +100,8 @@ public struct SpeakCommand: ParsableCommand {
 
     // MARK: - VoxCPM2-specific options
 
-    @Option(name: .long, help: "[voxcpm2] Quantization variant: bf16 (default), int8, int4. Resolved against aufklarer/VoxCPM2-MLX-* unless --voxcpm2-model-id is set.")
+    @Option(name: .long, help: "[voxcpm2] Quantization variant: bf16 (default), int8, int4. Resolves to aufklarer/VoxCPM2-MLX-<variant>.")
     public var voxcpm2Variant: String = "bf16"
-
-    @Option(name: .long, help: "[voxcpm2] Full HuggingFace model ID, overrides --voxcpm2-variant. Defaults to the resolved aufklarer bundle.")
-    public var voxcpm2ModelId: String?
 
     @Option(name: .long, help: "[voxcpm2] Style instruction")
     public var voxcpm2Instruct: String?
@@ -150,8 +146,8 @@ public struct SpeakCommand: ParsableCommand {
 
     public func validate() throws {
         let eng = engine.lowercased()
-        guard eng == "qwen3" || eng == "cosyvoice" || eng == "coreml" || eng == "voxcpm2" else {
-            throw ValidationError("--engine must be 'qwen3', 'cosyvoice', 'coreml', or 'voxcpm2'")
+        guard eng == "qwen3" || eng == "cosyvoice" || eng == "voxcpm2" else {
+            throw ValidationError("--engine must be 'qwen3', 'cosyvoice', or 'voxcpm2'. For CoreML, use the `qwen3-tts-coreml` subcommand.")
         }
         if text == nil && batchFile == nil && !listSpeakers {
             throw ValidationError("Either a text argument, --batch-file, or --list-speakers must be provided")
@@ -167,13 +163,12 @@ public struct SpeakCommand: ParsableCommand {
     }
 
     public func run() throws {
-        if engine.lowercased() == "cosyvoice" {
+        switch engine.lowercased() {
+        case "cosyvoice":
             try runCosyVoice()
-        } else if engine.lowercased() == "coreml" {
-            try runCoreML()
-        } else if engine.lowercased() == "voxcpm2" {
+        case "voxcpm2":
             try runVoxCPM2()
-        } else {
+        default:
             try runQwen3()
         }
     }
@@ -400,58 +395,9 @@ public struct SpeakCommand: ParsableCommand {
         }
     }
 
-    // MARK: - CoreML engine
-
-    private func runCoreML() throws {
-        guard let text else {
-            throw ValidationError("Text is required for CoreML TTS")
-        }
-        try runAsync {
-            // If modelId looks like a local path, use it directly
-            let localDir: String? = self.modelId.hasPrefix("/") ? self.modelId : nil
-            let model = try await Qwen3TTSCoreMLModel.fromPretrained(
-                localPath: localDir
-            ) { progress, status in
-                print("\r  [\(Int(progress * 100))%] \(status)", terminator: "")
-                fflush(stdout)
-            }
-            print()
-
-            let lang = self.language ?? "english"
-            // CoreML backend needs higher temperature (0.8) — low temp is degenerate
-            let coremlTemp: Float = self.temperature == 0.3 ? 0.8 : self.temperature
-            print("Synthesizing with CoreML engine (language: \(lang))...")
-            let start = CFAbsoluteTimeGetCurrent()
-            let audio = try model.synthesize(
-                text: text, language: lang,
-                temperature: coremlTemp, topK: Int(self.topK),
-                maxTokens: self.maxTokens)
-            let elapsed = CFAbsoluteTimeGetCurrent() - start
-            let duration = Double(audio.count) / 24000.0
-
-            print(String(format: "  Generated %.2fs audio in %.1fs (RTF: %.2f)",
-                         duration, elapsed, elapsed / max(duration, 0.01)))
-
-            let outputURL = URL(fileURLWithPath: self.output)
-            try WAVWriter.write(samples: audio, sampleRate: 24000, to: outputURL)
-            print("  Saved: \(outputURL.path)")
-
-            if self.play {
-                let player = try AVAudioPlayer(contentsOf: outputURL)
-                player.play()
-                while player.isPlaying {
-                    try await Task.sleep(nanoseconds: 100_000_000)
-                }
-            }
-
-            model.unload()
-        }
-    }
-
     // MARK: - VoxCPM2 engine
 
     private func resolvedVoxCPM2ModelId() throws -> String {
-        if let explicit = voxcpm2ModelId { return explicit }
         switch voxcpm2Variant.lowercased() {
         case "bf16":
             return "aufklarer/VoxCPM2-MLX-bf16"
