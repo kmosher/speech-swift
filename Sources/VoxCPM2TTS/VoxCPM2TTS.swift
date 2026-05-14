@@ -415,8 +415,13 @@ public final class VoxCPM2TTSModel: Module {
                 prefix: "feat_decoder.estimator.delta_time_mlp",
                 from: sanitized
             )
-            try loadMiniCPMModel(
-                feat_decoder.estimator.decoder,
+            // Use the generic recursive loader (same path as base_lm). The
+            // explicit loadMiniCPMModel below only loaded .weight per Linear
+            // and silently skipped .scales / .biases — which left every
+            // quantized Linear in the DiT decoder at random init in the
+            // int8 / int4 bundles, producing near-no-op layers.
+            try loadWeights(
+                into: feat_decoder.estimator.decoder,
                 prefix: "feat_decoder.estimator.decoder",
                 from: sanitized
             )
@@ -675,6 +680,15 @@ public final class VoxCPM2TTSModel: Module {
         }
         if let bias = weights["\(prefix).bias"] {
             params["bias"] = .value(bias)
+        }
+        // QuantizedLinear also has `scales` and `biases` parameters. Without
+        // loading these the dequantised matmul gets random values from
+        // `quantize()`'s placeholder init and the layer becomes a near-no-op.
+        if let scales = weights["\(prefix).scales"] {
+            params["scales"] = .value(scales)
+        }
+        if let qBiases = weights["\(prefix).biases"] {
+            params["biases"] = .value(qBiases)
         }
         guard !params.isEmpty else { return }
         try linear.update(parameters: ModuleParameters(values: params), verify: .shapeMismatch)
