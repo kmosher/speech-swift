@@ -113,6 +113,33 @@ private func handleOpenAISpeech(
         let eosBias: Float = (json["eos_logit_bias"] as? Double).map(Float.init)
             ?? defaultEosLogitBias(forModelId: modelId)
 
+        // OpenAI's gpt-4o-mini-tts API uses `instructions` for natural-language
+        // style control ("speak excitedly", "in a low whisper", etc.). Qwen3
+        // CustomVoice supports the exact same idea via its `instruct` arg, so
+        // we expose it under OpenAI's field name. Base model ignores it.
+        // Empty string is treated as "no override" — falls back to the engine's
+        // default ("Speak naturally." for CustomVoice).
+        let instructions: String? = (json["instructions"] as? String)
+            .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+
+        // Voice cloning hook (custom extension to OpenAI's shape). `clone_ref`
+        // is either an absolute filesystem path or an https:// URL pointing at
+        // a WAV/audio file. When set, we force a Base-model variant (only
+        // Base has the ECAPA-TDNN speaker encoder), ignore the speaker /
+        // bucketing logic, and call synthesizeWithVoiceClone instead of
+        // synthesizeStream. Reference audio + extracted speaker embedding are
+        // cached by ref path so repeat calls cost the embedding-extraction
+        // pass once.
+        let cloneRef: String? = (json["clone_ref"] as? String)
+            .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        if let cloneRef {
+            return try await handleClone(
+                input: input,
+                cloneRef: cloneRef,
+                responseFormat: responseFormat,
+                modelId: modelId)
+        }
+
         switch selector.engine {
         case .qwen3:
             let model = try await modelCache.loadQwen3(modelId: modelId)
@@ -125,6 +152,7 @@ private func handleOpenAISpeech(
             }()
             let sampleRate = model.sampleRate
             let speaker = selector.speaker
+            let instruct = instructions
 
             let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
             // Streaming response body: write chunks as the model emits them.
@@ -145,6 +173,7 @@ private func handleOpenAISpeech(
                             text: input,
                             language: "english",
                             speaker: speaker,
+                            instruct: instruct,
                             sampling: sampling)
                         for try await chunk in stream {
                             guard !chunk.samples.isEmpty else { continue }
@@ -186,6 +215,107 @@ private func handleOpenAISpeech(
                     body: .init(byteBuffer: .init(data: pcm)))
             }
         }
+    }
+}
+
+// MARK: - Voice Cloning
+
+/// Cache of decoded reference audio + sample rate keyed by source path/URL.
+/// The model's own internal cache memoizes the speaker embedding it derives
+/// from the audio; this cache memoizes the audio decode + (when remote) the
+/// HTTP fetch so repeated /v1/audio/speech calls don't redownload.
+private let refAudioCache = RefAudioCache()
+
+actor RefAudioCache {
+    private var entries: [String: (samples: [Float], sampleRate: Int)] = [:]
+
+    func load(ref: String) async throws -> (samples: [Float], sampleRate: Int) {
+        if let cached = entries[ref] { return cached }
+        let data: Data
+        if ref.hasPrefix("http://") || ref.hasPrefix("https://") {
+            guard let url = URL(string: ref) else {
+                throw CloneError.invalidRef("Invalid URL: \(ref)")
+            }
+            let (fetched, response) = try await URLSession.shared.data(from: url)
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+                throw CloneError.invalidRef("Fetched \(ref): HTTP \(httpResponse.statusCode)")
+            }
+            data = fetched
+        } else {
+            // Reject anything that doesn't look like an absolute path. Relative
+            // paths would resolve against the server's cwd, which is rarely
+            // what callers expect.
+            guard ref.hasPrefix("/") else {
+                throw CloneError.invalidRef(
+                    "clone_ref must be an absolute path or http(s):// URL (got '\(ref)')")
+            }
+            data = try Data(contentsOf: URL(fileURLWithPath: ref))
+        }
+        // decodeWAVData lives in AudioServer.swift; it writes to a temp file
+        // then uses AudioFileLoader, which handles WAV/M4A/MP3/etc via
+        // AVAudioFile. Target 24kHz to match Qwen3's expected rate.
+        let samples = try decodeWAVData(data, targetSampleRate: 24000)
+        let entry = (samples: samples, sampleRate: 24000)
+        entries[ref] = entry
+        return entry
+    }
+}
+
+enum CloneError: Error, LocalizedError {
+    case invalidRef(String)
+    case modelHasNoEncoder
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidRef(let msg): return msg
+        case .modelHasNoEncoder:
+            return "Selected model has no speaker encoder (cloning requires a Base variant, not CustomVoice)"
+        }
+    }
+}
+
+/// Run a one-shot voice-clone synthesis. Cloning is batched (no streaming API
+/// upstream) and Base-only. If the caller asked for a CustomVoice variant we
+/// silently force the Base equivalent — CustomVoice doesn't ship the
+/// ECAPA-TDNN encoder weights.
+private func handleClone(
+    input: String,
+    cloneRef: String,
+    responseFormat: String,
+    modelId: String?
+) async throws -> Response {
+    // Force a Base variant. Honor the caller's size/precision choice when
+    // they picked a Base; otherwise default to 0.6B 8-bit (empirical sweet
+    // spot from earlier testing).
+    let baseModelId: String
+    if let modelId, modelId.contains("Qwen3-TTS-") && !modelId.contains("CustomVoice") {
+        baseModelId = modelId
+    } else {
+        baseModelId = "aufklarer/Qwen3-TTS-12Hz-0.6B-Base-MLX-8bit"
+    }
+    let model = try await modelCache.loadQwen3(modelId: baseModelId)
+    let (refSamples, refRate) = try await refAudioCache.load(ref: cloneRef)
+    let samples = model.synthesizeWithVoiceClone(
+        text: input,
+        referenceAudio: refSamples,
+        referenceSampleRate: refRate,
+        language: "english")
+    if samples.isEmpty {
+        return errorResponse("Cloned synthesis produced no audio", status: .internalServerError)
+    }
+    let sampleRate = model.sampleRate
+    if responseFormat == "wav" {
+        let wav = try encodeWAV(samples: samples, sampleRate: sampleRate)
+        return Response(
+            status: .ok,
+            headers: [.contentType: "audio/wav"],
+            body: .init(byteBuffer: .init(data: wav)))
+    } else {
+        let pcm = float32ToPCM16LE(samples)
+        return Response(
+            status: .ok,
+            headers: [.contentType: "audio/pcm"],
+            body: .init(byteBuffer: .init(data: pcm)))
     }
 }
 
