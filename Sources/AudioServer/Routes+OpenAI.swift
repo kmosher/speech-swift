@@ -5,13 +5,22 @@ import NIOCore
 import Qwen3TTS
 import CosyVoiceTTS
 
-/// Qwen3-TTS' default sampling (`eosLogitBias: 0.0`) emits the end-of-speech
-/// token a frame or two early on plenty of common phrases, so the tail of
-/// the last syllable gets clipped. Negative bias pushes EOS later. -2.0 is
-/// the default we picked empirically: meaningfully reduces tail clipping
-/// without inducing rambling or stuttered trailing silence. Caller can
-/// override per-request with `eos_logit_bias` in the OpenAI JSON body.
-private let defaultEosLogitBias: Float = -2.0
+/// Default EOS-logit bias for Qwen3-TTS, per model variant.
+///
+/// The Base variants emit EOS a frame or two early on common phrases (tail
+/// of the last syllable clips), so we push EOS out with a negative bias.
+/// CustomVoice's EOS is calibrated correctly and the same negative bias
+/// makes it ramble for 6+ seconds on a 3-second phrase. Empirically:
+///   - Base 8-bit + bias=0.0 → clipped tail
+///   - Base 8-bit + bias=-2.0 → clean
+///   - CustomVoice 4-bit + bias=0.0 → clean
+///   - CustomVoice 4-bit + bias=-1.0 → drawn-out
+///
+/// Caller can always override per-request with `eos_logit_bias`.
+private func defaultEosLogitBias(forModelId modelId: String?) -> Float {
+    if let modelId, modelId.contains("CustomVoice") { return 0.0 }
+    return -2.0
+}
 
 // MARK: - OpenAI-Compatible REST Routes
 //
@@ -104,18 +113,29 @@ private func handleOpenAISpeech(
         let samples: [Float]
         let sampleRate: Int
 
-        let eosBias: Float = (json["eos_logit_bias"] as? Double).map(Float.init) ?? defaultEosLogitBias
+        let eosBias: Float = (json["eos_logit_bias"] as? Double).map(Float.init)
+            ?? defaultEosLogitBias(forModelId: modelId)
 
         switch selector.engine {
         case .qwen3:
             let model = try await modelCache.loadQwen3(modelId: modelId)
             var sampling = SamplingConfig.default
             sampling.eosLogitBias = eosBias
-            samples = model.synthesize(
+            // synthesizeStream emits per-frame AudioChunk values rather than
+            // running the codec decode in one shot. Accumulating into a single
+            // [Float] keeps the response shape identical to before but
+            // exercises the streaming codepath, which (in practice) drops
+            // fewer end-of-frame samples than the batched call.
+            var accumulated: [Float] = []
+            let stream = model.synthesizeStream(
                 text: input,
                 language: "english",
                 speaker: selector.speaker,
                 sampling: sampling)
+            for try await chunk in stream {
+                accumulated.append(contentsOf: chunk.samples)
+            }
+            samples = accumulated
             sampleRate = model.sampleRate
         case .cosyvoice:
             let model = try await modelCache.loadCosyVoice(modelId: modelId)
@@ -175,12 +195,23 @@ struct VoiceSelector: Sendable {
     let speaker: String?
 }
 
-/// Built-in Qwen3-TTS Base-model speakers. Used both for bare-name passthrough
-/// and as the bucket that `claude_*` / `blend_*` per-session IDs hash into.
-/// The CustomVoice variant has 9 speakers — once it's wired up as a swappable
-/// model, this list extends. For now the 4 Base speakers give per-Claude
-/// audible distinction even though only `ryan` is true US English.
-let qwen3BaseSpeakers: [String] = ["ryan", "vivian", "ono_anna", "sohee"]
+/// Speaker bucket that `claude_*` / `blend_*` per-session IDs hash into.
+/// Restricted to the English-native CustomVoice speakers so per-Claude voices
+/// don't land on Mandarin/Japanese/Korean-accented English mid-sentence.
+/// CustomVoice has 9 total (also: vivian, ono_anna, sohee, eric+dylan dialects,
+/// uncle_fu); extend this list if you want more variety and accept the
+/// language-mismatch artifacts.
+/// Note: the Base model variants have empty spk_id and silently ignore the
+/// speaker parameter — only CustomVoice actually honors speaker selection.
+let qwen3BucketSpeakers: [String] = ["ryan", "serena", "aiden"]
+
+/// Bare names recognized by parseVoiceSelector outside the bucket. Includes
+/// all 9 CustomVoice speakers + the Base "speakers" (which are no-ops on
+/// Base but still accepted for forward-compat with future variants).
+let qwen3KnownSpeakers: Set<String> = [
+    "ryan", "serena", "aiden", "vivian", "ono_anna", "sohee",
+    "eric", "dylan", "uncle_fu",
+]
 
 /// Parses the OpenAI `voice` field into engine + speaker.
 ///
@@ -202,11 +233,11 @@ func parseVoiceSelector(_ raw: String) -> VoiceSelector {
     }
 
     // Per-session bucketing: any claude_/blend_ prefix hashes into the
-    // built-in speaker pool. Stable per ID across restarts.
+    // English-native speaker pool. Stable per ID across restarts.
     if trimmed.hasPrefix("claude_") || trimmed.hasPrefix("blend_") {
         let digest = Array(SHA256.hash(data: Data(trimmed.utf8)))
         let firstByte = Int(digest[0])
-        let speaker = qwen3BaseSpeakers[firstByte % qwen3BaseSpeakers.count]
+        let speaker = qwen3BucketSpeakers[firstByte % qwen3BucketSpeakers.count]
         return VoiceSelector(engine: .qwen3, speaker: speaker)
     }
 
@@ -228,8 +259,10 @@ func parseVoiceSelector(_ raw: String) -> VoiceSelector {
         }
     }
 
-    // Bare Qwen3 speaker names (the documented English/Chinese/Japanese/Korean set).
-    if Set(qwen3BaseSpeakers).contains(trimmed) {
+    // Bare Qwen3 speaker names — accepted whether or not the active variant
+    // actually honors them. (Base variants ignore the speaker; CustomVoice
+    // uses it.)
+    if qwen3KnownSpeakers.contains(trimmed) {
         return VoiceSelector(engine: .qwen3, speaker: trimmed)
     }
 
