@@ -4,6 +4,14 @@ import NIOCore
 import Qwen3TTS
 import CosyVoiceTTS
 
+/// Qwen3-TTS' default sampling (`eosLogitBias: 0.0`) emits the end-of-speech
+/// token a frame or two early on plenty of common phrases, so the tail of
+/// the last syllable gets clipped. Negative bias pushes EOS later. -2.0 is
+/// the default we picked empirically: meaningfully reduces tail clipping
+/// without inducing rambling or stuttered trailing silence. Caller can
+/// override per-request with `eos_logit_bias` in the OpenAI JSON body.
+private let defaultEosLogitBias: Float = -2.0
+
 // MARK: - OpenAI-Compatible REST Routes
 //
 // Adds `POST /v1/audio/speech` (and eventually `/v1/audio/transcriptions`)
@@ -15,6 +23,44 @@ import CosyVoiceTTS
 //
 // Engine + speaker selection happens entirely through the `voice` field.
 // See `parseVoiceSelector(_:)` for the parsing rules.
+
+/// Per-model variant cache. Lets clients select Qwen3 size+precision per
+/// request via the OpenAI `model` field without rebuilding the server, and
+/// keeps previously-loaded variants resident so A/B testing doesn't pay the
+/// download/load cost on every switch. Each variant is a few GB of MLX
+/// weights, so callers should know what they're loading.
+private let modelCache = VariantModelCache()
+
+actor VariantModelCache {
+    private var qwen3: [String: Qwen3TTSModel] = [:]
+    private var cosyvoice: [String: CosyVoiceTTSModel] = [:]
+
+    func loadQwen3(modelId: String?) async throws -> Qwen3TTSModel {
+        let key = modelId ?? "default"
+        if let m = qwen3[key] { return m }
+        let m: Qwen3TTSModel
+        if let modelId = modelId {
+            m = try await Qwen3TTSModel.fromPretrained(modelId: modelId)
+        } else {
+            m = try await Qwen3TTSModel.fromPretrained()
+        }
+        qwen3[key] = m
+        return m
+    }
+
+    func loadCosyVoice(modelId: String?) async throws -> CosyVoiceTTSModel {
+        let key = modelId ?? "default"
+        if let m = cosyvoice[key] { return m }
+        let m: CosyVoiceTTSModel
+        if let modelId = modelId {
+            m = try await CosyVoiceTTSModel.fromPretrained(modelId: modelId)
+        } else {
+            m = try await CosyVoiceTTSModel.fromPretrained()
+        }
+        cosyvoice[key] = m
+        return m
+    }
+}
 
 func registerOpenAIRoutes(on router: Router<BasicRequestContext>, state: ModelState) {
     router.post("/v1/audio/speech", use: handleOpenAISpeech(state: state))
@@ -48,16 +94,30 @@ private func handleOpenAISpeech(
                 status: .badRequest)
         }
 
+        // `model` field is the OpenAI hook for selecting model size/precision.
+        // We treat it as an HF model ID when it matches a recognized prefix;
+        // anything else (incl. OpenAI's "tts-1"/"tts-1-hd") falls through to
+        // the engine's default. Variants are cached after first load.
+        let modelId = (json["model"] as? String).flatMap(resolveVariantModelId)
+
         let samples: [Float]
         let sampleRate: Int
 
+        let eosBias: Float = (json["eos_logit_bias"] as? Double).map(Float.init) ?? defaultEosLogitBias
+
         switch selector.engine {
         case .qwen3:
-            let model = try await state.loadTTS()
-            samples = model.synthesize(text: input, language: "english", speaker: selector.speaker)
+            let model = try await modelCache.loadQwen3(modelId: modelId)
+            var sampling = SamplingConfig.default
+            sampling.eosLogitBias = eosBias
+            samples = model.synthesize(
+                text: input,
+                language: "english",
+                speaker: selector.speaker,
+                sampling: sampling)
             sampleRate = model.sampleRate
         case .cosyvoice:
-            let model = try await state.loadCosyVoice()
+            let model = try await modelCache.loadCosyVoice(modelId: modelId)
             samples = model.synthesize(text: input, language: "english")
             sampleRate = 24000
         }
@@ -83,6 +143,21 @@ private func handleOpenAISpeech(
                 body: .init(byteBuffer: .init(data: pcm)))
         }
     }
+}
+
+// MARK: - Model Variant Resolution
+
+/// Maps the OpenAI `model` field to a HuggingFace model ID when it's a
+/// recognized variant prefix, otherwise returns nil (engine uses its built-in
+/// default). Currently recognizes the aufklarer-published Qwen3-TTS and
+/// CosyVoice MLX variants. Bare prefix forms ("qwen3-0.6b-8bit" etc.) are a
+/// future shorthand; today we accept the full HF path.
+func resolveVariantModelId(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return nil }
+    if trimmed.hasPrefix("aufklarer/Qwen3-TTS-") { return trimmed }
+    if trimmed.hasPrefix("aufklarer/CosyVoice") { return trimmed }
+    return nil
 }
 
 // MARK: - Voice → Engine + Speaker Parsing
