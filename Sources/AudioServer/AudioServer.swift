@@ -173,6 +173,10 @@ public struct AudioServer {
                 body: .init(byteBuffer: .init(data: wavData)))
         }
 
+        // OpenAI-compatible REST routes (/v1/audio/speech and friends).
+        // See Routes+OpenAI.swift.
+        registerOpenAIRoutes(on: router, state: state)
+
         return router
     }
 }

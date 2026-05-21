@@ -119,7 +119,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", "2.5.0"..<"2.17.0"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.6.0")
+        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.6.0"),
+        // swift-websocket 1.6.0 (released 2026-05-21) breaks builds: WSCore
+        // imports NIOSSL without declaring it as a target dep, fails to
+        // compile. Pin to <1.6.0 until upstream resolves the packaging bug.
+        .package(url: "https://github.com/hummingbird-project/swift-websocket.git", "1.0.0"..<"1.6.0"),
     ],
     targets: [
         .target(
