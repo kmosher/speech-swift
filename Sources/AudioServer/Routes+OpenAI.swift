@@ -110,60 +110,119 @@ private func handleOpenAISpeech(
         // the engine's default. Variants are cached after first load.
         let modelId = (json["model"] as? String).flatMap(resolveVariantModelId)
 
-        let samples: [Float]
-        let sampleRate: Int
-
         let eosBias: Float = (json["eos_logit_bias"] as? Double).map(Float.init)
             ?? defaultEosLogitBias(forModelId: modelId)
 
         switch selector.engine {
         case .qwen3:
             let model = try await modelCache.loadQwen3(modelId: modelId)
-            var sampling = SamplingConfig.default
-            sampling.eosLogitBias = eosBias
-            // synthesizeStream emits per-frame AudioChunk values rather than
-            // running the codec decode in one shot. Accumulating into a single
-            // [Float] keeps the response shape identical to before but
-            // exercises the streaming codepath, which (in practice) drops
-            // fewer end-of-frame samples than the batched call.
-            var accumulated: [Float] = []
-            let stream = model.synthesizeStream(
-                text: input,
-                language: "english",
-                speaker: selector.speaker,
-                sampling: sampling)
-            for try await chunk in stream {
-                accumulated.append(contentsOf: chunk.samples)
-            }
-            samples = accumulated
-            sampleRate = model.sampleRate
+            // `let` (not `var`) so the streaming-body closure can capture it
+            // without tripping Swift 6's SendableClosureCaptures rule.
+            let sampling: SamplingConfig = {
+                var s = SamplingConfig.default
+                s.eosLogitBias = eosBias
+                return s
+            }()
+            let sampleRate = model.sampleRate
+            let speaker = selector.speaker
+
+            let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
+            // Streaming response body: write chunks as the model emits them.
+            // For WAV, the first chunk is a streaming RIFF header with
+            // 0x7FFFFFFF size sentinels — clients (afplay, ffplay, AVPlayer,
+            // browsers via MediaSource) treat that as "play until connection
+            // closes" instead of trying to seek to the end.
+            return Response(
+                status: .ok,
+                headers: [.contentType: contentType],
+                body: .init { writer in
+                    do {
+                        if responseFormat == "wav" {
+                            try await writer.write(
+                                ByteBuffer(bytes: streamingWAVHeader(sampleRate: sampleRate)))
+                        }
+                        let stream = model.synthesizeStream(
+                            text: input,
+                            language: "english",
+                            speaker: speaker,
+                            sampling: sampling)
+                        for try await chunk in stream {
+                            guard !chunk.samples.isEmpty else { continue }
+                            let pcm = float32ToPCM16LE(chunk.samples)
+                            try await writer.write(ByteBuffer(bytes: pcm))
+                        }
+                        try await writer.finish(nil)
+                    } catch {
+                        // Once we've sent headers we can't switch to a 4xx/5xx,
+                        // so the best we can do is end the stream early. Body
+                        // consumers will see the truncation; the error path is
+                        // visible in server logs.
+                        try? await writer.finish(nil)
+                        throw error
+                    }
+                })
+
         case .cosyvoice:
+            // CosyVoice synth is still one-shot here; streaming variant is
+            // available upstream but we haven't wired it yet. Same accumulate-
+            // then-respond shape we had before.
             let model = try await modelCache.loadCosyVoice(modelId: modelId)
-            samples = model.synthesize(text: input, language: "english")
-            sampleRate = 24000
-        }
-
-        if samples.isEmpty {
-            return errorResponse("Synthesis produced no audio", status: .internalServerError)
-        }
-
-        if responseFormat == "wav" {
-            let wav = try encodeWAV(samples: samples, sampleRate: sampleRate)
-            return Response(
-                status: .ok,
-                headers: [.contentType: "audio/wav"],
-                body: .init(byteBuffer: .init(data: wav)))
-        } else {
-            // Raw 16-bit little-endian PCM at the model's native rate.
-            // Caller is responsible for knowing the rate (advertised via the
-            // standard Kokoro/Qwen3 24kHz convention).
-            let pcm = float32ToPCM16LE(samples)
-            return Response(
-                status: .ok,
-                headers: [.contentType: "audio/pcm"],
-                body: .init(byteBuffer: .init(data: pcm)))
+            let samples = model.synthesize(text: input, language: "english")
+            let sampleRate = 24000
+            if samples.isEmpty {
+                return errorResponse("Synthesis produced no audio", status: .internalServerError)
+            }
+            if responseFormat == "wav" {
+                let wav = try encodeWAV(samples: samples, sampleRate: sampleRate)
+                return Response(
+                    status: .ok,
+                    headers: [.contentType: "audio/wav"],
+                    body: .init(byteBuffer: .init(data: wav)))
+            } else {
+                let pcm = float32ToPCM16LE(samples)
+                return Response(
+                    status: .ok,
+                    headers: [.contentType: "audio/pcm"],
+                    body: .init(byteBuffer: .init(data: pcm)))
+            }
         }
     }
+}
+
+// MARK: - Streaming WAV header
+
+/// 44-byte RIFF/WAV header advertising "size unknown" via the 0x7FFFFFFF
+/// sentinel for the file and data chunk sizes. Standard streaming-WAV
+/// convention: clients stop reading when the connection closes rather than
+/// trying to seek to the declared end. Mirrors the helper macos-speech-server
+/// uses for its Kokoro-on-FluidAudio streaming response.
+func streamingWAVHeader(sampleRate: Int) -> [UInt8] {
+    var out: [UInt8] = []
+    out.reserveCapacity(44)
+    func u32(_ v: UInt32) {
+        out.append(UInt8(v & 0xFF))
+        out.append(UInt8((v >> 8) & 0xFF))
+        out.append(UInt8((v >> 16) & 0xFF))
+        out.append(UInt8((v >> 24) & 0xFF))
+    }
+    func u16(_ v: UInt16) {
+        out.append(UInt8(v & 0xFF))
+        out.append(UInt8((v >> 8) & 0xFF))
+    }
+    out.append(contentsOf: Array("RIFF".utf8))
+    u32(0x7FFF_FFFF)  // unknown file size
+    out.append(contentsOf: Array("WAVE".utf8))
+    out.append(contentsOf: Array("fmt ".utf8))
+    u32(16)                              // PCM fmt chunk size
+    u16(1)                               // PCM format
+    u16(1)                               // mono
+    u32(UInt32(sampleRate))
+    u32(UInt32(sampleRate * 2))          // byte rate (16-bit mono)
+    u16(2)                               // block align
+    u16(16)                              // bits per sample
+    out.append(contentsOf: Array("data".utf8))
+    u32(0x7FFF_FFFF)                     // unknown data size
+    return out
 }
 
 // MARK: - Model Variant Resolution
