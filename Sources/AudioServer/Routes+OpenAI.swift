@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Hummingbird
 import NIOCore
@@ -174,6 +175,13 @@ struct VoiceSelector: Sendable {
     let speaker: String?
 }
 
+/// Built-in Qwen3-TTS Base-model speakers. Used both for bare-name passthrough
+/// and as the bucket that `claude_*` / `blend_*` per-session IDs hash into.
+/// The CustomVoice variant has 9 speakers — once it's wired up as a swappable
+/// model, this list extends. For now the 4 Base speakers give per-Claude
+/// audible distinction even though only `ryan` is true US English.
+let qwen3BaseSpeakers: [String] = ["ryan", "vivian", "ono_anna", "sohee"]
+
 /// Parses the OpenAI `voice` field into engine + speaker.
 ///
 /// Accepted shapes:
@@ -181,6 +189,9 @@ struct VoiceSelector: Sendable {
 /// - `"cosyvoice"` or `"cosyvoice:..."` → CosyVoice (speaker ignored for now)
 /// - bare Qwen3 speaker names (`"ryan"`, `"vivian"`, `"sohee"`, `"ono_anna"`)
 ///   → Qwen3 with that speaker
+/// - `"claude_<hex>"` / `"blend_<hex>"` → deterministically hashed into the
+///   Qwen3 speaker pool. Same ID always picks the same speaker, so each
+///   Claude session gets a stable per-session voice without coordination.
 /// - OpenAI's stock voices (`"alloy"`, `"echo"`, etc.) → Qwen3 with default
 ///   speaker (so OpenAI-targeted clients work without modification)
 /// - anything else → Qwen3 with default speaker
@@ -188,6 +199,15 @@ func parseVoiceSelector(_ raw: String) -> VoiceSelector {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if trimmed.isEmpty {
         return VoiceSelector(engine: .qwen3, speaker: nil)
+    }
+
+    // Per-session bucketing: any claude_/blend_ prefix hashes into the
+    // built-in speaker pool. Stable per ID across restarts.
+    if trimmed.hasPrefix("claude_") || trimmed.hasPrefix("blend_") {
+        let digest = Array(SHA256.hash(data: Data(trimmed.utf8)))
+        let firstByte = Int(digest[0])
+        let speaker = qwen3BaseSpeakers[firstByte % qwen3BaseSpeakers.count]
+        return VoiceSelector(engine: .qwen3, speaker: speaker)
     }
 
     // engine:speaker / engine/speaker prefix form.
@@ -209,8 +229,7 @@ func parseVoiceSelector(_ raw: String) -> VoiceSelector {
     }
 
     // Bare Qwen3 speaker names (the documented English/Chinese/Japanese/Korean set).
-    let qwen3Speakers: Set<String> = ["ryan", "vivian", "ono_anna", "sohee"]
-    if qwen3Speakers.contains(trimmed) {
+    if Set(qwen3BaseSpeakers).contains(trimmed) {
         return VoiceSelector(engine: .qwen3, speaker: trimmed)
     }
 
