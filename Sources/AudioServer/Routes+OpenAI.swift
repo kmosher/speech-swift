@@ -4,6 +4,7 @@ import Hummingbird
 import NIOCore
 import Qwen3TTS
 import CosyVoiceTTS
+import VoxCPM2TTS
 
 /// Default EOS-logit bias for Qwen3-TTS, per model variant.
 ///
@@ -44,6 +45,20 @@ private let modelCache = VariantModelCache()
 actor VariantModelCache {
     private var qwen3: [String: Qwen3TTSModel] = [:]
     private var cosyvoice: [String: CosyVoiceTTSModel] = [:]
+    private var voxcpm2: [String: VoxCPM2TTSModel] = [:]
+
+    func loadVoxCPM2(modelId: String?) async throws -> VoxCPM2TTSModel {
+        let key = modelId ?? "default"
+        if let m = voxcpm2[key] { return m }
+        let m: VoxCPM2TTSModel
+        if let modelId = modelId {
+            m = try await VoxCPM2TTSModel.fromPretrained(modelId: modelId)
+        } else {
+            m = try await VoxCPM2TTSModel.fromPretrained()
+        }
+        voxcpm2[key] = m
+        return m
+    }
 
     func loadQwen3(modelId: String?) async throws -> Qwen3TTSModel {
         let key = modelId ?? "default"
@@ -124,19 +139,38 @@ private func handleOpenAISpeech(
 
         // Voice cloning hook (custom extension to OpenAI's shape). `clone_ref`
         // is either an absolute filesystem path or an https:// URL pointing at
-        // a WAV/audio file. When set, we force a Base-model variant (only
-        // Base has the ECAPA-TDNN speaker encoder), ignore the speaker /
-        // bucketing logic, and call synthesizeWithVoiceClone instead of
-        // synthesizeStream. Reference audio + extracted speaker embedding are
-        // cached by ref path so repeat calls cost the embedding-extraction
-        // pass once.
+        // a WAV/audio file. When set we route to a clone-capable engine, ignore
+        // the speaker / bucketing logic, and synthesize in the reference voice.
+        //
+        // Engine selection (`clone_engine`, default "voxcpm2"):
+        //   - "voxcpm2": VoxCPM2 (default, higher fidelity). Best results need
+        //     `clone_ref_text` — the transcript of the reference clip — which
+        //     enables VoxCPM2's in-context prompt path. Without it we fall back
+        //     to VoxCPM2's audio-only ref path (lower fidelity).
+        //   - "qwen3":   Qwen3 0.6B Base + ECAPA-TDNN speaker embedding. No
+        //     transcript needed; the older, lower-quality path.
+        // Reference audio is cached by (path, sample-rate) so repeat calls skip
+        // the decode/fetch.
         let cloneRef: String? = (json["clone_ref"] as? String)
             .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        let cloneRefText: String? = (json["clone_ref_text"] as? String)
+            .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        let cloneEngine = ((json["clone_engine"] as? String) ?? "voxcpm2")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let cloneRef {
-            return try await handleClone(
+            if cloneEngine == "qwen3" {
+                return try await handleQwen3Clone(
+                    input: input,
+                    cloneRef: cloneRef,
+                    responseFormat: responseFormat,
+                    modelId: modelId)
+            }
+            return try await handleVoxCPM2Clone(
                 input: input,
                 cloneRef: cloneRef,
+                cloneRefText: cloneRefText,
                 responseFormat: responseFormat,
+                instructions: instructions,
                 modelId: modelId)
         }
 
@@ -227,10 +261,13 @@ private func handleOpenAISpeech(
 private let refAudioCache = RefAudioCache()
 
 actor RefAudioCache {
+    // Keyed by "<ref>@<rate>" so the same source decoded at two rates (Qwen3
+    // wants 24kHz, VoxCPM2 wants 16kHz) doesn't collide.
     private var entries: [String: (samples: [Float], sampleRate: Int)] = [:]
 
-    func load(ref: String) async throws -> (samples: [Float], sampleRate: Int) {
-        if let cached = entries[ref] { return cached }
+    func load(ref: String, targetSampleRate: Int) async throws -> (samples: [Float], sampleRate: Int) {
+        let cacheKey = "\(ref)@\(targetSampleRate)"
+        if let cached = entries[cacheKey] { return cached }
         let data: Data
         if ref.hasPrefix("http://") || ref.hasPrefix("https://") {
             guard let url = URL(string: ref) else {
@@ -253,10 +290,10 @@ actor RefAudioCache {
         }
         // decodeWAVData lives in AudioServer.swift; it writes to a temp file
         // then uses AudioFileLoader, which handles WAV/M4A/MP3/etc via
-        // AVAudioFile. Target 24kHz to match Qwen3's expected rate.
-        let samples = try decodeWAVData(data, targetSampleRate: 24000)
-        let entry = (samples: samples, sampleRate: 24000)
-        entries[ref] = entry
+        // AVAudioFile.
+        let samples = try decodeWAVData(data, targetSampleRate: targetSampleRate)
+        let entry = (samples: samples, sampleRate: targetSampleRate)
+        entries[cacheKey] = entry
         return entry
     }
 }
@@ -274,19 +311,59 @@ enum CloneError: Error, LocalizedError {
     }
 }
 
-/// Run a one-shot voice-clone synthesis. Cloning is batched (no streaming API
-/// upstream) and Base-only. If the caller asked for a CustomVoice variant we
-/// silently force the Base equivalent — CustomVoice doesn't ship the
-/// ECAPA-TDNN encoder weights.
-private func handleClone(
+/// VoxCPM2 voice clone (the default, higher-fidelity path). Batched — no
+/// streaming generate API upstream. VoxCPM2 is 2B / 48kHz and designed for
+/// zero-shot cloning: when given the reference clip *and* its transcript it
+/// uses an in-context "prompt" (continue-this-voice) which is materially
+/// better than embedding-only cloning. When the transcript is missing we fall
+/// back to the audio-only `refAudio` conditioning, which still clones but with
+/// lower fidelity. Reference audio is decoded at 16kHz (VoxCPM2's encoder rate).
+private func handleVoxCPM2Clone(
+    input: String,
+    cloneRef: String,
+    cloneRefText: String?,
+    responseFormat: String,
+    instructions: String?,
+    modelId: String?
+) async throws -> Response {
+    // Honor an explicit VoxCPM2 model id; otherwise use the engine default.
+    let voxModelId: String? = (modelId?.contains("VoxCPM2") == true) ? modelId : nil
+    let model = try await modelCache.loadVoxCPM2(modelId: voxModelId)
+    let (refSamples, _) = try await refAudioCache.load(ref: cloneRef, targetSampleRate: 16000)
+
+    let samples: [Float]
+    if let cloneRefText {
+        // High-fidelity in-context prompt path: (promptAudio, promptText).
+        samples = try await model.generateVoxCPM2(
+            text: input,
+            language: "english",
+            promptText: cloneRefText,
+            promptAudio: refSamples,
+            instruct: instructions)
+    } else {
+        // Audio-only fallback: no transcript, so use the refAudio conditioning.
+        samples = try await model.generateVoxCPM2(
+            text: input,
+            language: "english",
+            refAudio: refSamples,
+            instruct: instructions)
+    }
+
+    if samples.isEmpty {
+        return errorResponse("Cloned synthesis produced no audio", status: .internalServerError)
+    }
+    return try audioResponse(samples: samples, sampleRate: model.sampleRate, responseFormat: responseFormat)
+}
+
+/// Qwen3 0.6B Base voice clone (legacy path, `clone_engine:"qwen3"`). Base-only
+/// — CustomVoice doesn't ship the ECAPA-TDNN encoder, so a CustomVoice/unknown
+/// `model` is silently forced to 0.6B Base 8-bit. Embedding-only; no transcript.
+private func handleQwen3Clone(
     input: String,
     cloneRef: String,
     responseFormat: String,
     modelId: String?
 ) async throws -> Response {
-    // Force a Base variant. Honor the caller's size/precision choice when
-    // they picked a Base; otherwise default to 0.6B 8-bit (empirical sweet
-    // spot from earlier testing).
     let baseModelId: String
     if let modelId, modelId.contains("Qwen3-TTS-") && !modelId.contains("CustomVoice") {
         baseModelId = modelId
@@ -294,7 +371,7 @@ private func handleClone(
         baseModelId = "aufklarer/Qwen3-TTS-12Hz-0.6B-Base-MLX-8bit"
     }
     let model = try await modelCache.loadQwen3(modelId: baseModelId)
-    let (refSamples, refRate) = try await refAudioCache.load(ref: cloneRef)
+    let (refSamples, refRate) = try await refAudioCache.load(ref: cloneRef, targetSampleRate: 24000)
     let samples = model.synthesizeWithVoiceClone(
         text: input,
         referenceAudio: refSamples,
@@ -303,7 +380,11 @@ private func handleClone(
     if samples.isEmpty {
         return errorResponse("Cloned synthesis produced no audio", status: .internalServerError)
     }
-    let sampleRate = model.sampleRate
+    return try audioResponse(samples: samples, sampleRate: model.sampleRate, responseFormat: responseFormat)
+}
+
+/// Shared one-shot (non-streaming) audio response: WAV-encode or raw PCM16LE.
+private func audioResponse(samples: [Float], sampleRate: Int, responseFormat: String) throws -> Response {
     if responseFormat == "wav" {
         let wav = try encodeWAV(samples: samples, sampleRate: sampleRate)
         return Response(

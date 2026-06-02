@@ -365,6 +365,7 @@ let package = Package(
                 "Qwen3ASR",
                 "Qwen3TTS",
                 "CosyVoiceTTS",
+                "VoxCPM2TTS",
                 "PersonaPlex",
                 "SpeechEnhancement",
                 "AudioCommon",
