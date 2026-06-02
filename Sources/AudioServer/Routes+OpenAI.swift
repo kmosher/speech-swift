@@ -157,6 +157,24 @@ private func handleOpenAISpeech(
             .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         let cloneEngine = ((json["clone_engine"] as? String) ?? "voxcpm2")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        // Registry-driven cloning: if no explicit clone_ref was given, the
+        // `voice` field can still resolve to a pre-curated registry entry.
+        // - Bare id ("ed_irish_m") → exact lookup.
+        // - "claude_<hex>" / "blend_<hex>" → SHA-256 hashed across the sorted
+        //   registry. Same session id → same voice across restarts.
+        // Empty registry falls through to legacy Qwen3 bucketing in
+        // parseVoiceSelector.
+        let registryEntry: VoiceEntry? = {
+            if cloneRef != nil { return nil }  // explicit clone wins
+            if voiceRegistry.isEmpty { return nil }
+            let raw = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if raw.hasPrefix("claude_") || raw.hasPrefix("blend_") {
+                return voiceRegistry.hashedLookup(sessionId: raw)
+            }
+            return voiceRegistry.lookup(id: raw)
+        }()
+
         if let cloneRef {
             if cloneEngine == "qwen3" {
                 return try await handleQwen3Clone(
@@ -169,6 +187,15 @@ private func handleOpenAISpeech(
                 input: input,
                 cloneRef: cloneRef,
                 cloneRefText: cloneRefText,
+                responseFormat: responseFormat,
+                instructions: instructions,
+                modelId: modelId)
+        }
+        if let entry = registryEntry {
+            return try await handleVoxCPM2Clone(
+                input: input,
+                cloneRef: entry.refPath,
+                cloneRefText: entry.refText,
                 responseFormat: responseFormat,
                 instructions: instructions,
                 modelId: modelId)
@@ -311,13 +338,21 @@ enum CloneError: Error, LocalizedError {
     }
 }
 
-/// VoxCPM2 voice clone (the default, higher-fidelity path). Batched — no
-/// streaming generate API upstream. VoxCPM2 is 2B / 48kHz and designed for
-/// zero-shot cloning: when given the reference clip *and* its transcript it
-/// uses an in-context "prompt" (continue-this-voice) which is materially
-/// better than embedding-only cloning. When the transcript is missing we fall
-/// back to the audio-only `refAudio` conditioning, which still clones but with
-/// lower fidelity. Reference audio is decoded at 16kHz (VoxCPM2's encoder rate).
+/// VoxCPM2 voice clone (the default, higher-fidelity path). VoxCPM2 is 2B /
+/// 48kHz and designed for zero-shot cloning: given the reference clip *and*
+/// its transcript it uses an in-context "prompt" (continue-this-voice) which
+/// is materially better than embedding-only cloning. Without the transcript
+/// we fall back to the audio-only `refAudio` conditioning.
+///
+/// Long inputs are split into sentences and synthesized per-sentence — VoxCPM2
+/// destabilizes (speed-up, buzzing) on long single calls per the upstream
+/// usage guide, and per-sentence streaming also cuts TTFB on multi-sentence
+/// inputs.
+///
+/// Reference audio is decoded at 16kHz (VoxCPM2's encoder rate). The decoded
+/// float buffer is cached in `refAudioCache`; the model still re-encodes the
+/// VAE features per call. That cost is small relative to the LM autoregress,
+/// so a deeper cache (encoded-prompt-tensor keyed by ref path) is deferred.
 private func handleVoxCPM2Clone(
     input: String,
     cloneRef: String,
@@ -330,29 +365,81 @@ private func handleVoxCPM2Clone(
     let voxModelId: String? = (modelId?.contains("VoxCPM2") == true) ? modelId : nil
     let model = try await modelCache.loadVoxCPM2(modelId: voxModelId)
     let (refSamples, _) = try await refAudioCache.load(ref: cloneRef, targetSampleRate: 16000)
+    let sampleRate = model.sampleRate
+    let sentences = splitIntoSentences(input)
+    let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
+    let format = responseFormat
 
-    let samples: [Float]
-    if let cloneRefText {
-        // High-fidelity in-context prompt path: (promptAudio, promptText).
-        samples = try await model.generateVoxCPM2(
-            text: input,
-            language: "english",
-            promptText: cloneRefText,
-            promptAudio: refSamples,
-            instruct: instructions)
-    } else {
-        // Audio-only fallback: no transcript, so use the refAudio conditioning.
-        samples = try await model.generateVoxCPM2(
-            text: input,
-            language: "english",
-            refAudio: refSamples,
-            instruct: instructions)
-    }
+    return Response(
+        status: .ok,
+        headers: [.contentType: contentType],
+        body: .init { writer in
+            do {
+                if format == "wav" {
+                    try await writer.write(
+                        ByteBuffer(bytes: streamingWAVHeader(sampleRate: sampleRate)))
+                }
+                for sentence in sentences {
+                    let samples: [Float]
+                    if let cloneRefText {
+                        samples = try await model.generateVoxCPM2(
+                            text: sentence,
+                            language: "english",
+                            promptText: cloneRefText,
+                            promptAudio: refSamples,
+                            instruct: instructions)
+                    } else {
+                        samples = try await model.generateVoxCPM2(
+                            text: sentence,
+                            language: "english",
+                            refAudio: refSamples,
+                            instruct: instructions)
+                    }
+                    guard !samples.isEmpty else { continue }
+                    let pcm = float32ToPCM16LE(samples)
+                    try await writer.write(ByteBuffer(bytes: pcm))
+                }
+                try await writer.finish(nil)
+            } catch {
+                try? await writer.finish(nil)
+                throw error
+            }
+        })
+}
 
-    if samples.isEmpty {
-        return errorResponse("Cloned synthesis produced no audio", status: .internalServerError)
+/// Sentence segmentation for long-form VoxCPM2 synthesis. Splits on
+/// `.`/`!`/`?` followed by whitespace, plus paragraph breaks. Single-token
+/// inputs and inputs without terminal punctuation come back as a single
+/// segment — VoxCPM2 handles short clean inputs fine.
+///
+/// This is intentionally simple. We don't try to detect abbreviations
+/// ("Dr.", "U.S.") — at worst they cause an extra split which only affects
+/// prosody at sentence boundaries, not correctness. If that becomes audible,
+/// upgrade to NSLinguisticTagger sentence enumeration.
+func splitIntoSentences(_ text: String) -> [String] {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+    var out: [String] = []
+    var current = ""
+    let scalars = Array(trimmed)
+    var i = 0
+    while i < scalars.count {
+        let c = scalars[i]
+        current.append(c)
+        let isTerminal = (c == "." || c == "!" || c == "?" || c == "\n")
+        let nextIsSpaceOrEnd = (i + 1 >= scalars.count) || scalars[i + 1].isWhitespace
+        if isTerminal && nextIsSpaceOrEnd {
+            let segment = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !segment.isEmpty { out.append(segment) }
+            current = ""
+            // Skip following whitespace
+            while i + 1 < scalars.count && scalars[i + 1].isWhitespace { i += 1 }
+        }
+        i += 1
     }
-    return try audioResponse(samples: samples, sampleRate: model.sampleRate, responseFormat: responseFormat)
+    let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !tail.isEmpty { out.append(tail) }
+    return out.isEmpty ? [trimmed] : out
 }
 
 /// Qwen3 0.6B Base voice clone (legacy path, `clone_engine:"qwen3"`). Base-only
