@@ -1,3 +1,4 @@
+import AudioCommon
 import Foundation
 import Hummingbird
 import NIOCore
@@ -246,8 +247,16 @@ private func handleVoxCPM2Clone(
         })
 }
 
-/// Bare VoxCPM2 (no reference, no registry voice). Uses the model's default
-/// speaker. `instructions` still passes through for style steering.
+/// Bare VoxCPM2 (no reference, no registry voice). Without a prompt or ref,
+/// VoxCPM2 samples a fresh timbre from its prior on every `generateVoxCPM2`
+/// call — voice changes per sentence in a multi-sentence input.
+///
+/// To keep voice stable *within* a single API call, we bootstrap from
+/// sentence 1: synth it bare (free random voice), capture its samples +
+/// text, then use those as the in-context prompt for sentences 2..N.
+/// Sentences 2+ clone sentence 1, so the whole response shares one timbre.
+/// Across API calls the voice still varies — that's the intentional
+/// "lucky dip" character of bare VoxCPM2; we only lock within-call.
 private func handleVoxCPM2Bare(
     input: String,
     responseFormat: String,
@@ -270,11 +279,32 @@ private func handleVoxCPM2Bare(
                     try await writer.write(
                         ByteBuffer(bytes: streamingWAVHeader(sampleRate: sampleRate)))
                 }
-                for sentence in sentences {
-                    let samples = try await model.generateVoxCPM2(
-                        text: sentence,
-                        language: "english",
-                        instruct: instructions)
+                // Captured from sentence 1 and reused as the in-context prompt
+                // for sentences 2..N. promptAudio is consumed at the VAE rate
+                // (16kHz); sentence 1's output is at model.sampleRate (48kHz)
+                // so we resample once.
+                var bootstrapAudio16k: [Float]? = nil
+                var bootstrapText: String? = nil
+                for (i, sentence) in sentences.enumerated() {
+                    let samples: [Float]
+                    if i == 0 || bootstrapAudio16k == nil {
+                        samples = try await model.generateVoxCPM2(
+                            text: sentence,
+                            language: "english",
+                            instruct: instructions)
+                        if !samples.isEmpty {
+                            bootstrapAudio16k = AudioFileLoader.resample(
+                                samples, from: sampleRate, to: 16000)
+                            bootstrapText = sentence
+                        }
+                    } else {
+                        samples = try await model.generateVoxCPM2(
+                            text: sentence,
+                            language: "english",
+                            promptText: bootstrapText,
+                            promptAudio: bootstrapAudio16k,
+                            instruct: instructions)
+                    }
                     guard !samples.isEmpty else { continue }
                     try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(samples)))
                 }
