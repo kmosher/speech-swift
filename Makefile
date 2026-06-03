@@ -10,15 +10,16 @@ build:
 	swift build -c release --disable-sandbox
 	./scripts/build_mlx_metallib.sh release
 
-# Install the freshly-built release binaries + their metallib into PREFIX.
-# Symlinks are used so a re-`make install` after a rebuild picks up the new
-# binary without having to re-run install. The mlx.metallib needs to sit
-# next to the binary at runtime — MLX resolves it by Bundle-style lookup.
-install: build
+# Install whatever's currently in .build/release/ into PREFIX. Decoupled
+# from `build` on purpose: the metallib step requires xcrun's `metal`,
+# which isn't always available (broken CLT, etc.). Run `make build`
+# explicitly when you want a fresh compile; this target just deploys.
+install:
+	@test -f .build/release/audio-server || { echo "no .build/release/audio-server — run 'make build' first"; exit 1; }
 	@mkdir -p $(PREFIX)/bin $(PREFIX)/share/speech-swift
 	@cp -f .build/release/audio-server $(PREFIX)/bin/audio-server
 	@cp -f .build/release/speech-server $(PREFIX)/bin/speech-server 2>/dev/null || true
-	@cp -f .build/arm64-apple-macosx/release/mlx.metallib $(PREFIX)/bin/mlx.metallib
+	@cp -fL .build/arm64-apple-macosx/release/mlx.metallib $(PREFIX)/bin/mlx.metallib
 	@echo "installed audio-server to $(PREFIX)/bin/"
 
 debug:
