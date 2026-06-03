@@ -36,13 +36,11 @@ actor VoxCPM2Cache {
     }
 }
 
-func registerOpenAIRoutes(on router: Router<BasicRequestContext>, state: ModelState) {
-    router.post("/v1/audio/speech", use: handleOpenAISpeech(state: state))
+func registerOpenAIRoutes(on router: Router<BasicRequestContext>) {
+    router.post("/v1/audio/speech", use: handleOpenAISpeech())
 }
 
-private func handleOpenAISpeech(
-    state: ModelState
-) -> @Sendable (Request, BasicRequestContext) async throws -> Response {
+private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) async throws -> Response {
     return { request, _ in
         let body = try await request.body.collect(upTo: 1024 * 1024)
         guard let json = try JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any] else {

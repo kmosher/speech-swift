@@ -362,15 +362,10 @@ let package = Package(
         .target(
             name: "AudioServer",
             dependencies: [
-                "Qwen3ASR",
-                "Qwen3TTS",
-                "CosyVoiceTTS",
+                "ParakeetASR",
                 "VoxCPM2TTS",
-                "PersonaPlex",
-                "SpeechEnhancement",
                 "AudioCommon",
                 .product(name: "Hummingbird", package: "hummingbird"),
-                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket")
             ]
         ),
         .executableTarget(
