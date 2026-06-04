@@ -15,6 +15,14 @@ import VoxCPM2TTS
 // Single engine: VoxCPM2 (2B, 48kHz). Voice selection happens via the `voice`
 // field; see the routing rules in `handleOpenAISpeech` for the precedence.
 
+/// PCM wire-format sample rate. OpenAI's `/v1/audio/speech` PCM response is
+/// implicitly 24kHz mono int16 — that's what `tts-1` emits and what every
+/// OpenAI-shaped client assumes. We honor that contract regardless of the
+/// engine's native rate (VoxCPM2 is 48kHz) by resampling at the write
+/// boundary. Clients that want native quality should ask for `wav`, whose
+/// header carries the real sample rate.
+private let PCMWireSampleRate: Int = 24000
+
 /// Per-model variant cache. Lets clients select a VoxCPM2 size/precision via
 /// the OpenAI `model` field. Each variant is a couple of GB of MLX weights,
 /// so we keep loaded variants resident across requests.
@@ -210,6 +218,12 @@ private func handleVoxCPM2Clone(
     let sentences = splitIntoSentences(input)
     let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
     let format = responseFormat
+    // OpenAI's /v1/audio/speech PCM contract is implicitly 24kHz mono int16
+    // (that's what tts-1 emits and what every OpenAI-shaped client assumes).
+    // VoxCPM2 generates at 48kHz, so for PCM responses we resample down to
+    // 24kHz at the write boundary. WAV stays at native rate — the header
+    // carries the real sample rate, so the client adapts.
+    let wireSampleRate = (format == "pcm") ? PCMWireSampleRate : sampleRate
 
     return Response(
         status: .ok,
@@ -237,7 +251,10 @@ private func handleVoxCPM2Clone(
                             instruct: instructions)
                     }
                     guard !samples.isEmpty else { continue }
-                    try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(samples)))
+                    let wireSamples = (wireSampleRate == sampleRate)
+                        ? samples
+                        : AudioFileLoader.resample(samples, from: sampleRate, to: wireSampleRate)
+                    try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(wireSamples)))
                 }
                 try await writer.finish(nil)
             } catch {
@@ -269,6 +286,9 @@ private func handleVoxCPM2Bare(
     let sentences = splitIntoSentences(input)
     let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
     let format = responseFormat
+    // See handleVoxCPM2Clone for the rationale: PCM wire format is pinned to
+    // 24kHz for OpenAI compatibility; WAV streams at native rate.
+    let wireSampleRate = (format == "pcm") ? PCMWireSampleRate : sampleRate
 
     return Response(
         status: .ok,
@@ -306,7 +326,10 @@ private func handleVoxCPM2Bare(
                             instruct: instructions)
                     }
                     guard !samples.isEmpty else { continue }
-                    try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(samples)))
+                    let wireSamples = (wireSampleRate == sampleRate)
+                        ? samples
+                        : AudioFileLoader.resample(samples, from: sampleRate, to: wireSampleRate)
+                    try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(wireSamples)))
                 }
                 try await writer.finish(nil)
             } catch {
