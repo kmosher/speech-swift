@@ -29,10 +29,25 @@ actor ParakeetCache {
         model = m
         return m
     }
+
+    /// Drop the resident model. Returns whether one was loaded. The CoreML
+    /// model is freed by ARC as its reference clears here.
+    func evict() -> Bool {
+        let had = model != nil
+        model = nil
+        return had
+    }
+}
+
+/// Release the resident Parakeet model (module-internal hook for the idle
+/// monitor; the cache instance itself is file-private).
+func evictASRModels() async -> Bool {
+    await parakeetCache.evict()
 }
 
 func registerOpenAITranscribeRoute(on router: Router<BasicRequestContext>) {
     router.post("/v1/audio/transcriptions") { request, _ in
+        await activityClock.stamp()
         let contentType = request.headers[.contentType] ?? ""
         guard let boundary = parseMultipartBoundary(contentType) else {
             return errorResponse(

@@ -18,6 +18,9 @@ struct AudioServerCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Load all models on startup (slower start, faster first request)")
     var preload: Bool = false
 
+    @Option(name: .long, help: "Release resident models after this many seconds idle (0 = never; models reload lazily on the next request)")
+    var idleTimeout: Int = 0
+
     func run() async throws {
         if let argv0 = CommandLine.arguments.first,
            (argv0 as NSString).lastPathComponent == "audio-server" {
@@ -26,7 +29,7 @@ struct AudioServerCommand: AsyncParsableCommand {
             ))
         }
 
-        let server = AudioServer(host: host, port: port)
+        let server = AudioServer(host: host, port: port, idleTimeout: Double(idleTimeout))
 
         if preload {
             print("Preloading models...")

@@ -20,10 +20,14 @@ import AudioCommon
 public struct AudioServer {
     let host: String
     let port: Int
+    /// Seconds of inactivity after which resident models are released. 0
+    /// disables eviction (models stay resident for the life of the process).
+    let idleTimeout: Double
 
-    public init(host: String = "127.0.0.1", port: Int = 8080, preload: Bool = false) {
+    public init(host: String = "127.0.0.1", port: Int = 8080, preload: Bool = false, idleTimeout: Double = 0) {
         self.host = host
         self.port = port
+        self.idleTimeout = idleTimeout
     }
 
     public func run() async throws {
@@ -31,6 +35,9 @@ public struct AudioServer {
         let app = Application(
             router: router,
             configuration: .init(address: .hostname(host, port: port)))
+        if idleTimeout > 0 {
+            Task { await runIdleMonitor(timeout: idleTimeout) }
+        }
         try await app.run()
     }
 

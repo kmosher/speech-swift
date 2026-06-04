@@ -43,6 +43,22 @@ actor VoxCPM2Cache {
         entries[key] = m
         return m
     }
+
+    /// Drop all resident variants. Returns how many were released. The
+    /// VoxCPM2TTSModels deallocate here (assuming no in-flight request still
+    /// holds one), returning their MLX buffers to the pool for the idle
+    /// monitor's subsequent clearCache().
+    func evict() -> Int {
+        let n = entries.count
+        entries.removeAll()
+        return n
+    }
+}
+
+/// Release all resident VoxCPM2 variants (module-internal hook for the idle
+/// monitor; the cache instance itself is file-private). Returns the count.
+func evictTTSModels() async -> Int {
+    await modelCache.evict()
 }
 
 func registerOpenAIRoutes(on router: Router<BasicRequestContext>) {
@@ -51,6 +67,7 @@ func registerOpenAIRoutes(on router: Router<BasicRequestContext>) {
 
 private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) async throws -> Response {
     return { request, _ in
+        await activityClock.stamp()
         let body = try await request.body.collect(upTo: 1024 * 1024)
         guard let json = try JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any] else {
             return errorResponse("Body must be JSON", status: .badRequest)

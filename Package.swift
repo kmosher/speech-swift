@@ -366,6 +366,7 @@ let package = Package(
                 "VoxCPM2TTS",
                 "AudioCommon",
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "MLX", package: "mlx-swift"),
             ]
         ),
         .executableTarget(
