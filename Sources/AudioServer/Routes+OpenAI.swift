@@ -94,7 +94,16 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         // treat it as an HF model ID when it matches a recognized VoxCPM2
         // prefix; anything else (incl. OpenAI's "tts-1"/"tts-1-hd") falls
         // through to the engine default.
-        let modelId = (json["model"] as? String).flatMap(resolveVariantModelId)
+        let modelRaw = (json["model"] as? String) ?? ""
+        let modelId = resolveVariantModelId(modelRaw)
+
+        // Engine selection. F5-TTS is the default for voice-cloned and registry
+        // voices (lighter + faster than VoxCPM2 at comparable clone quality).
+        // VoxCPM2 stays reachable two ways: `voice=voxcpm2…`, or a `model` field
+        // naming a VoxCPM2 variant. The bare/no-voice path always uses VoxCPM2
+        // (its per-call "lucky dip" timbre is intentional; F5 has no bare mode).
+        let voiceLower = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let useVoxCPM2 = voiceLower.hasPrefix("voxcpm2") || modelRaw.contains("VoxCPM2")
 
         // OpenAI's gpt-4o-mini-tts API uses `instructions` for natural-language
         // style control ("speak excitedly", "in a low whisper"). VoxCPM2 takes
@@ -121,17 +130,24 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         //        sorted registry. Same session id → same voice across restarts.
         //   3. `voice=voxcpm2` (or `voxcpm2:...`) → bare VoxCPM2 default speaker.
         //   4. Anything else → bare VoxCPM2 default speaker.
+        // Cloning paths (1 and 2) use F5 by default; `useVoxCPM2` opts back in.
         if let cloneRef {
-            return try await handleVoxCPM2Clone(
+            if useVoxCPM2 {
+                return try await handleVoxCPM2Clone(
+                    input: input,
+                    cloneRef: cloneRef,
+                    cloneRefText: cloneRefText,
+                    responseFormat: responseFormat,
+                    instructions: instructions,
+                    modelId: modelId)
+            }
+            return try await handleF5Clone(
                 input: input,
                 cloneRef: cloneRef,
                 cloneRefText: cloneRefText,
-                responseFormat: responseFormat,
-                instructions: instructions,
-                modelId: modelId)
+                responseFormat: responseFormat)
         }
 
-        let voiceLower = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let registryEntry: VoiceEntry? = {
             guard !voiceRegistry.isEmpty, !voiceLower.isEmpty else { return nil }
             if voiceLower.hasPrefix("claude_") || voiceLower.hasPrefix("blend_") {
@@ -140,13 +156,20 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
             return voiceRegistry.lookup(id: voiceLower)
         }()
         if let entry = registryEntry {
-            return try await handleVoxCPM2Clone(
+            if useVoxCPM2 {
+                return try await handleVoxCPM2Clone(
+                    input: input,
+                    cloneRef: entry.refPath,
+                    cloneRefText: entry.refText,
+                    responseFormat: responseFormat,
+                    instructions: instructions,
+                    modelId: modelId)
+            }
+            return try await handleF5Clone(
                 input: input,
                 cloneRef: entry.refPath,
                 cloneRefText: entry.refText,
-                responseFormat: responseFormat,
-                instructions: instructions,
-                modelId: modelId)
+                responseFormat: responseFormat)
         }
 
         return try await handleVoxCPM2Bare(

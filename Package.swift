@@ -61,6 +61,14 @@ let package = Package(
             targets: ["VoxCPM2TTS"]
         ),
         .library(
+            name: "Vocos",
+            targets: ["Vocos"]
+        ),
+        .library(
+            name: "F5TTS",
+            targets: ["F5TTS"]
+        ),
+        .library(
             name: "MAGNeTMusicGen",
             targets: ["MAGNeTMusicGen"]
         ),
@@ -268,6 +276,42 @@ let package = Package(
                 .product(name: "Transformers", package: "swift-transformers")
             ]
         ),
+        // Vendored from lucasnewman/vocos-swift (the 24kHz mel vocoder F5 uses).
+        // In-tree rather than a SwiftPM dep because its sibling f5-tts-swift
+        // pins swift-transformers <1.0, which conflicts with this repo's 1.1.x.
+        // The source already targets transformers 1.1 / mlx-swift 0.29, so it
+        // builds clean against our resolved versions.
+        .target(
+            name: "Vocos",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFFT", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+            ]
+        ),
+        // Vendored from lucasnewman/f5-tts-swift. F5-TTS flow-matching TTS with
+        // voice cloning, 24kHz out. See the Vocos note above for why it's
+        // in-tree. Resources are the mel filterbank + the upstream default
+        // reference clip (used when no clone ref is supplied).
+        .target(
+            name: "F5TTS",
+            dependencies: [
+                "Vocos",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXFFT", package: "mlx-swift"),
+                .product(name: "MLXLinalg", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            resources: [
+                .copy("Resources/test_en_1_ref_short.wav"),
+                .copy("Resources/mel_filters.npy"),
+            ]
+        ),
         .target(
             name: "OmnilingualASR",
             dependencies: [
@@ -364,6 +408,7 @@ let package = Package(
             dependencies: [
                 "ParakeetASR",
                 "VoxCPM2TTS",
+                "F5TTS",
                 "AudioCommon",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "MLX", package: "mlx-swift"),

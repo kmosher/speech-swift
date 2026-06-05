@@ -48,12 +48,13 @@ func runIdleMonitor(timeout: Double) async {
         // its reference drops — not reflected in the MLX figure below.)
         let before = MLX.Memory.activeMemory + MLX.Memory.cacheMemory
         let ttsReleased = await evictTTSModels()
+        let f5Released = await evictF5Models()
         let asrReleased = await evictASRModels()
-        if ttsReleased == 0 && !asrReleased { continue }  // nothing was loaded
+        if ttsReleased == 0 && f5Released == 0 && !asrReleased { continue }  // nothing was loaded
         MLX.Memory.clearCache()
         let freedMB = Double(before - (MLX.Memory.activeMemory + MLX.Memory.cacheMemory)) / 1_048_576
         let msg = "[idle] released models after \(Int(idle))s idle "
-            + "(tts variants: \(ttsReleased), asr: \(asrReleased)); "
+            + "(tts variants: \(ttsReleased), f5: \(f5Released), asr: \(asrReleased)); "
             + "reclaimed ~\(String(format: "%.0f", freedMB)) MB of MLX memory\n"
         FileHandle.standardError.write(Data(msg.utf8))
     }
