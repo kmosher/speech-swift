@@ -105,10 +105,79 @@ func f5PreferredRef(forRef ref: String, fallbackText: String?) -> (String, Strin
     return (f5Wav, text.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
-/// F5 voice clone. Emits a streaming WAV/PCM body, but unlike handleVoxCPM2Clone
-/// it synthesizes the whole input in a single F5 pass (F5 generates continuous
-/// multi-sentence speech; per-sentence batching would add join artifacts). F5
-/// has no style/`instruct` parameter, so `instructions` is not threaded here.
+/// Longest text (characters) to hand F5 in a single generation. F5 stays
+/// faithful up to ~140 chars / ~11s but degrades past that (garbled words,
+/// repetition, reference-text leak) on a single long pass. Inputs longer than
+/// this are chunked; see `chunkTextForF5`.
+private let F5MaxChunkChars = 140
+
+/// Silence inserted between synthesized chunks (a natural inter-chunk pause and
+/// a clean join — see handleF5Clone).
+private let F5ChunkGapSeconds = 0.06
+
+/// Split input into chunks small enough for F5 to render cleanly, preferring
+/// sentence boundaries. Sentences are packed greedily up to `maxChars`; a single
+/// sentence longer than `maxChars` is split further at word boundaries.
+func chunkTextForF5(_ input: String, maxChars: Int) -> [String] {
+    var chunks: [String] = []
+    var current = ""
+    func flush() {
+        let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { chunks.append(t) }
+        current = ""
+    }
+    for sentence in splitIntoSentences(input) {
+        if sentence.count > maxChars {
+            flush()
+            chunks.append(contentsOf: splitLongRun(sentence, maxChars: maxChars))
+        } else if current.isEmpty {
+            current = sentence
+        } else if current.count + 1 + sentence.count <= maxChars {
+            current += " " + sentence
+        } else {
+            flush()
+            current = sentence
+        }
+    }
+    flush()
+    return chunks.isEmpty ? [input] : chunks
+}
+
+/// Split a single over-long sentence into <=maxChars pieces at word boundaries.
+private func splitLongRun(_ sentence: String, maxChars: Int) -> [String] {
+    var out: [String] = []
+    var current = ""
+    for word in sentence.split(separator: " ") {
+        if current.isEmpty {
+            current = String(word)
+        } else if current.count + 1 + word.count <= maxChars {
+            current += " " + word
+        } else {
+            out.append(current)
+            current = String(word)
+        }
+    }
+    if !current.isEmpty { out.append(current) }
+    return out
+}
+
+/// Trim leading/trailing near-silence from a chunk so chunks butt-join at the
+/// speech, not on F5's variable edge silence/breath. Threshold is absolute
+/// amplitude on the normalized [-1, 1] samples.
+func trimEdgeSilence(_ samples: [Float], threshold: Float = 0.015) -> [Float] {
+    guard let first = samples.firstIndex(where: { abs($0) > threshold }),
+          let last = samples.lastIndex(where: { abs($0) > threshold }) else { return [] }
+    return Array(samples[first...last])
+}
+
+/// F5 voice clone. F5 renders continuous multi-sentence speech cleanly only up
+/// to ~140 chars; beyond that a single pass garbles/repeats/leaks the reference
+/// text. So we chunk longer inputs (at sentence boundaries) and synthesize each
+/// chunk in one pass, joining them with a short silence after edge-trimming —
+/// which avoids BOTH the long-pass degradation and the raw per-sentence
+/// concatenation clicks ("clatter") that splitting every sentence produced.
+/// Each chunk streams out as it finishes. F5 has no style/`instruct` parameter,
+/// so `instructions` is not threaded here.
 func handleF5Clone(
     input: String,
     cloneRef: String,
@@ -138,14 +207,9 @@ func handleF5Clone(
     let sampleRate = F5TTS.sampleRate
     let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
     let format = responseFormat
+    let chunks = chunkTextForF5(input, maxChars: F5MaxChunkChars)
+    let gap = [Float](repeating: 0, count: Int(F5ChunkGapSeconds * Double(sampleRate)))
 
-    // Synthesize the WHOLE input in one F5 pass — do NOT split into sentences
-    // the way the VoxCPM2 path does. VoxCPM2 needs per-sentence batching for
-    // stability; F5 is trained to generate continuous multi-sentence speech and
-    // re-conditioning per sentence instead produces audible artifacts at every
-    // join (a "clatter" between fragments). One pass also lets the duration
-    // estimate see the full text. (TTFB cost: the whole clip is synthesized
-    // before the first bytes go out — acceptable for these short TTS inputs.)
     return Response(
         status: .ok,
         headers: [.contentType: contentType],
@@ -155,13 +219,21 @@ func handleF5Clone(
                     try await writer.write(
                         ByteBuffer(bytes: streamingWAVHeader(sampleRate: sampleRate)))
                 }
-                let out = try await model.generate(
-                    text: input,
-                    referenceAudio: refAudio,
-                    referenceAudioText: refText)
-                let samples = out.asArray(Float.self)
-                if !samples.isEmpty {
+                var wroteAudio = false
+                for chunk in chunks {
+                    let out = try await model.generate(
+                        text: chunk,
+                        referenceAudio: refAudio,
+                        referenceAudioText: refText)
+                    let samples = trimEdgeSilence(out.asArray(Float.self))
+                    guard !samples.isEmpty else { continue }
+                    // Clean silence between chunks (a natural pause) avoids the
+                    // waveform-discontinuity click of butt-joining F5 outputs.
+                    if wroteAudio {
+                        try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(gap)))
+                    }
                     try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(samples)))
+                    wroteAudio = true
                 }
                 try await writer.finish(nil)
             } catch {
