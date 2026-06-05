@@ -87,6 +87,24 @@ actor F5RefCache {
     }
 }
 
+/// Resolve the reference F5 should clone from. If an `f5_ref.wav` + `f5_ref.txt`
+/// pair sits beside the given registry `ref.wav`, prefer it (a clean, aligned,
+/// short clip purpose-built for F5); otherwise return the original ref and its
+/// supplied transcript. Only registry-style local `…/ref.wav` paths are
+/// rewritten — ad-hoc `clone_ref` paths/URLs pass through untouched.
+func f5PreferredRef(forRef ref: String, fallbackText: String?) -> (String, String?) {
+    guard ref.hasSuffix("/ref.wav") else { return (ref, fallbackText) }
+    let dir = String(ref.dropLast("ref.wav".count))  // retains trailing slash
+    let f5Wav = dir + "f5_ref.wav"
+    let f5Txt = dir + "f5_ref.txt"
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: f5Wav), fm.fileExists(atPath: f5Txt),
+          let text = try? String(contentsOfFile: f5Txt, encoding: .utf8) else {
+        return (ref, fallbackText)
+    }
+    return (f5Wav, text.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
 /// F5 voice clone. Mirrors handleVoxCPM2Clone's streaming-WAV shape: split the
 /// input into sentences and write each sentence's PCM as it finishes, so
 /// multi-sentence replies start playing before the whole thing is synthesized.
@@ -97,16 +115,24 @@ func handleF5Clone(
     cloneRefText: String?,
     responseFormat: String
 ) async throws -> Response {
+    // Prefer an F5-specific reference pair when one sits next to the registry
+    // ref. `f5_ref.wav` + `f5_ref.txt` (built by tts-bench/build_f5_refs.py) are
+    // a silence-trimmed ~10s 24kHz clip and a transcript generated FROM that
+    // clip, so the audio and text stay aligned and short — which F5 needs and
+    // the VoxCPM2-curated ref.wav/ref.txt don't guarantee. Falls back to the
+    // supplied ref when no F5 pair exists (e.g. an ad-hoc clone_ref URL).
+    let (resolvedRef, resolvedRefText) = f5PreferredRef(forRef: cloneRef, fallbackText: cloneRefText)
+
     let model: F5TTS
     let refAudio: MLXArray
     do {
         model = try await f5Cache.get()
-        refAudio = try await f5RefCache.load(ref: cloneRef)
+        refAudio = try await f5RefCache.load(ref: resolvedRef)
     } catch {
         FileHandle.standardError.write(Data("[f5] load failed: \(error)\n".utf8))
         return errorResponse("F5 load failed: \(error)", status: .internalServerError)
     }
-    let refText = cloneRefText ?? ""
+    let refText = resolvedRefText ?? ""
     // F5 is 24kHz native, which already equals the OpenAI PCM wire rate, so
     // neither WAV nor PCM needs resampling on the way out.
     let sampleRate = F5TTS.sampleRate

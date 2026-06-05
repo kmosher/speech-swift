@@ -274,15 +274,24 @@ public class F5TTS: Module {
         let processedText = referenceAudioText + " " + text
 
         // Pass an EXPLICIT total duration rather than `nil`. `nil` invokes the
-        // duration_v2 predictor, which is unreliable for server use — it
-        // over-predicts (noise/clicking tail) or under-predicts (truncation)
-        // depending on ref length. Instead use the reference's audio-to-text
-        // ratio to size the generated span, the same approach tts-bench's F5
-        // path uses. duration here is TOTAL frames (reference + generated):
-        // sample() floors it at the reference length internally.
+        // duration_v2 predictor, which is unreliable here (over-predicts → a
+        // clicking noise tail; under-predicts → truncation). Size the generated
+        // span ourselves from a CLAMPED speech rate.
+        //
+        // We deliberately do NOT trust the reference's own audio-to-text density
+        // (F5TTS.estimatedDuration): registry refs range ~8–18 chars/sec because
+        // of accent, silence, and sparse / under-caught transcripts, and a low
+        // density makes F5 stretch the text over too many frames — exactly the
+        // smeared, gappy "hoofbeats" artifact. Clamping the effective rate to a
+        // natural English band keeps the generated length sane for any ref while
+        // still tracking a genuinely slow/fast speaker within bounds. `duration`
+        // is TOTAL frames (reference + generated); sample() floors it at the
+        // reference length internally.
         let refFrames = referenceAudio.shape[0] / F5TTS.hopLength
-        let genSeconds = F5TTS.estimatedDuration(
-            refAudio: referenceAudio, refText: referenceAudioText, text: text)
+        let refSeconds = Double(referenceAudio.shape[0]) / Double(F5TTS.sampleRate)
+        let rawCharsPerSecond = Double(max(referenceAudioText.count, 1)) / max(refSeconds, 0.1)
+        let charsPerSecond = min(max(rawCharsPerSecond, 13.0), 18.0)
+        let genSeconds = Double(text.count) / charsPerSecond
         let totalFrames = refFrames + Int(genSeconds * F5TTS.framesPerSecond)
 
         let (outputAudio, _) = try self.sample(
