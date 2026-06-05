@@ -105,10 +105,10 @@ func f5PreferredRef(forRef ref: String, fallbackText: String?) -> (String, Strin
     return (f5Wav, text.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
-/// F5 voice clone. Mirrors handleVoxCPM2Clone's streaming-WAV shape: split the
-/// input into sentences and write each sentence's PCM as it finishes, so
-/// multi-sentence replies start playing before the whole thing is synthesized.
-/// F5 has no style/`instruct` parameter, so `instructions` is not threaded here.
+/// F5 voice clone. Emits a streaming WAV/PCM body, but unlike handleVoxCPM2Clone
+/// it synthesizes the whole input in a single F5 pass (F5 generates continuous
+/// multi-sentence speech; per-sentence batching would add join artifacts). F5
+/// has no style/`instruct` parameter, so `instructions` is not threaded here.
 func handleF5Clone(
     input: String,
     cloneRef: String,
@@ -136,10 +136,16 @@ func handleF5Clone(
     // F5 is 24kHz native, which already equals the OpenAI PCM wire rate, so
     // neither WAV nor PCM needs resampling on the way out.
     let sampleRate = F5TTS.sampleRate
-    let sentences = splitIntoSentences(input)
     let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
     let format = responseFormat
 
+    // Synthesize the WHOLE input in one F5 pass — do NOT split into sentences
+    // the way the VoxCPM2 path does. VoxCPM2 needs per-sentence batching for
+    // stability; F5 is trained to generate continuous multi-sentence speech and
+    // re-conditioning per sentence instead produces audible artifacts at every
+    // join (a "clatter" between fragments). One pass also lets the duration
+    // estimate see the full text. (TTFB cost: the whole clip is synthesized
+    // before the first bytes go out — acceptable for these short TTS inputs.)
     return Response(
         status: .ok,
         headers: [.contentType: contentType],
@@ -149,13 +155,12 @@ func handleF5Clone(
                     try await writer.write(
                         ByteBuffer(bytes: streamingWAVHeader(sampleRate: sampleRate)))
                 }
-                for sentence in sentences {
-                    let out = try await model.generate(
-                        text: sentence,
-                        referenceAudio: refAudio,
-                        referenceAudioText: refText)
-                    let samples = out.asArray(Float.self)
-                    guard !samples.isEmpty else { continue }
+                let out = try await model.generate(
+                    text: input,
+                    referenceAudio: refAudio,
+                    referenceAudioText: refText)
+                let samples = out.asArray(Float.self)
+                if !samples.isEmpty {
                     try await writer.write(ByteBuffer(bytes: float32ToPCM16LE(samples)))
                 }
                 try await writer.finish(nil)

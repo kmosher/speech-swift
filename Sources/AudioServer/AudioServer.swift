@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HummingbirdCore
+import MLX
 import NIOCore
 import AudioCommon
 
@@ -31,6 +32,14 @@ public struct AudioServer {
     }
 
     public func run() async throws {
+        // Bound MLX's reusable buffer cache. With no limit it grows to the
+        // high-water mark of every distinct allocation size seen over the
+        // process lifetime; F5's per-request, duration-dependent buffer sizes
+        // made that balloon to ~50GB across a session. 4GB keeps buffer reuse
+        // fast while returning the rest to the OS. The idle monitor still does a
+        // full clearCache() after inactivity; this just caps growth while busy.
+        MLX.Memory.cacheLimit = 4 * 1024 * 1024 * 1024
+
         let router = buildRouter()
         let app = Application(
             router: router,
