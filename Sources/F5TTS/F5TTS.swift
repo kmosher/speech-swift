@@ -272,10 +272,23 @@ public class F5TTS: Module {
         let vocos = try await loadCachedVocos()
         let normalizedAudio = F5TTS.normalizeAudio(audio: referenceAudio)
         let processedText = referenceAudioText + " " + text
+
+        // Pass an EXPLICIT total duration rather than `nil`. `nil` invokes the
+        // duration_v2 predictor, which is unreliable for server use — it
+        // over-predicts (noise/clicking tail) or under-predicts (truncation)
+        // depending on ref length. Instead use the reference's audio-to-text
+        // ratio to size the generated span, the same approach tts-bench's F5
+        // path uses. duration here is TOTAL frames (reference + generated):
+        // sample() floors it at the reference length internally.
+        let refFrames = referenceAudio.shape[0] / F5TTS.hopLength
+        let genSeconds = F5TTS.estimatedDuration(
+            refAudio: referenceAudio, refText: referenceAudioText, text: text)
+        let totalFrames = refFrames + Int(genSeconds * F5TTS.framesPerSecond)
+
         let (outputAudio, _) = try self.sample(
             cond: normalizedAudio.expandedDimensions(axis: 0),
             text: [processedText],
-            duration: nil,
+            duration: totalFrames,
             steps: steps,
             method: method,
             cfgStrength: cfg,

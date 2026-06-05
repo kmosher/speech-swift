@@ -17,11 +17,6 @@ import NIOCore
 /// auto-download (lucasnewman/vocos-mel-24khz-mlx) cached on the model.
 let F5DefaultModelId = "lucasnewman/f5-tts-mlx"
 
-/// F5 conditions on the *entire* reference clip inline, so a long ref slows the
-/// flow integration and skews the duration estimate. Registry refs can run
-/// ~20s; trim to this many seconds — enough to carry timbre, bounded in cost.
-private let F5MaxRefSeconds = 12
-
 private let f5Cache = F5Cache()
 
 /// Single resident F5 model. Unlike VoxCPM2 there are no size/precision
@@ -79,11 +74,13 @@ actor F5RefCache {
             }
             data = try Data(contentsOf: URL(fileURLWithPath: ref))
         }
-        var samples = try decodeWAVData(data, targetSampleRate: F5TTS.sampleRate)
-        let cap = F5MaxRefSeconds * F5TTS.sampleRate
-        if samples.count > cap {
-            samples = Array(samples[..<cap])
-        }
+        // Do NOT trim the ref audio. F5 aligns the reference audio against the
+        // reference *transcript* (clone_ref_text / registry ref.txt); trimming
+        // the audio without trimming the text to match desyncs that alignment,
+        // which makes F5's duration predictor wildly over-estimate and fill the
+        // excess with noise (audible clicking / "hoofbeats"). Registry refs are
+        // already short (~18s), so the full clip is what the transcript covers.
+        let samples = try decodeWAVData(data, targetSampleRate: F5TTS.sampleRate)
         let arr = MLXArray(samples)
         entries[ref] = arr
         return arr
