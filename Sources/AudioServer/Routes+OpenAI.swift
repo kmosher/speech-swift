@@ -99,11 +99,16 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
 
         // Engine selection. F5-TTS is the default for voice-cloned and registry
         // voices (lighter + faster than VoxCPM2 at comparable clone quality).
-        // VoxCPM2 stays reachable two ways: `voice=voxcpm2…`, or a `model` field
-        // naming a VoxCPM2 variant. The bare/no-voice path always uses VoxCPM2
-        // (its per-call "lucky dip" timbre is intentional; F5 has no bare mode).
+        // VoxCPM2 is selected ONLY via `voice=voxcpm2…`. We deliberately do NOT
+        // key off the `model` field: voicemode populates `model` with its legacy
+        // default `aufklarer/VoxCPM2-MLX-bf16` on every request, so honoring a
+        // "VoxCPM2" model string would route ALL real traffic to VoxCPM2 and
+        // never reach F5 (and surface VoxCPM2's prompt-text leak). The `model`
+        // field still selects a VoxCPM2 size/precision *variant* once we're on
+        // the VoxCPM2 engine (see resolveVariantModelId). The bare/no-voice path
+        // uses VoxCPM2 (its "lucky dip" timbre is intentional; F5 has no bare mode).
         let voiceLower = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let useVoxCPM2 = voiceLower.hasPrefix("voxcpm2") || modelRaw.contains("VoxCPM2")
+        let useVoxCPM2 = voiceLower.hasPrefix("voxcpm2")
 
         // OpenAI's gpt-4o-mini-tts API uses `instructions` for natural-language
         // style control ("speak excitedly", "in a low whisper"). VoxCPM2 takes
