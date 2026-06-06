@@ -105,15 +105,36 @@ func f5PreferredRef(forRef ref: String, fallbackText: String?) -> (String, Strin
     return (f5Wav, text.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
+/// Read a Double from the environment, falling back to `dflt` when unset/unparseable.
+private func envDouble(_ name: String, _ dflt: Double) -> Double {
+    guard let s = ProcessInfo.processInfo.environment[name], let v = Double(s) else { return dflt }
+    return v
+}
+
+/// Read an Int from the environment, falling back to `dflt` when unset/unparseable.
+private func envInt(_ name: String, _ dflt: Int) -> Int {
+    guard let s = ProcessInfo.processInfo.environment[name], let v = Int(s) else { return dflt }
+    return v
+}
+
 /// Longest text (characters) to hand F5 in a single generation. F5 stays
-/// faithful up to ~140 chars / ~11s but degrades past that (garbled words,
-/// repetition, reference-text leak) on a single long pass. Inputs longer than
-/// this are chunked; see `chunkTextForF5`.
-private let F5MaxChunkChars = 140
+/// faithful up to roughly this length / ~16s but degrades past it (garbled
+/// words, repetition, reference-text leak) on a single long pass. This 200 is
+/// our own empirically-tuned ceiling, not an upstream F5 spec. Inputs longer
+/// than this are chunked; see `chunkTextForF5`. Override with
+/// `F5_MAX_CHUNK_CHARS` (<=0 disables chunking → one pass over the whole input).
+private var F5MaxChunkChars: Int { envInt("F5_MAX_CHUNK_CHARS", 200) }
 
 /// Silence inserted between synthesized chunks (a natural inter-chunk pause and
-/// a clean join — see handleF5Clone).
-private let F5ChunkGapSeconds = 0.06
+/// a clean join — see handleF5Clone). Override with `F5_CHUNK_GAP_SECONDS`.
+private var F5ChunkGapSeconds: Double { envDouble("F5_CHUNK_GAP_SECONDS", 0.06) }
+
+/// Clamp band (chars/sec) for F5's explicit duration estimate. Override with
+/// `F5_CPS_MIN` / `F5_CPS_MAX`; set `F5_DURATION_NATIVE=1` to ignore the clamp
+/// and use F5's own duration_v2 predictor instead.
+private var F5CpsMin: Double { envDouble("F5_CPS_MIN", 13.0) }
+private var F5CpsMax: Double { envDouble("F5_CPS_MAX", 18.0) }
+private var F5DurationNative: Bool { (ProcessInfo.processInfo.environment["F5_DURATION_NATIVE"] ?? "") == "1" }
 
 /// Split input into chunks small enough for F5 to render cleanly, preferring
 /// sentence boundaries. Sentences are packed greedily up to `maxChars`; a single
@@ -143,11 +164,65 @@ func chunkTextForF5(_ input: String, maxChars: Int) -> [String] {
     return chunks.isEmpty ? [input] : chunks
 }
 
-/// Split a single over-long sentence into <=maxChars pieces at word boundaries.
+/// Split a single over-long sentence into <=maxChars pieces. Prefer breaking at
+/// clause punctuation (comma, semicolon, colon, em/en dash) so the cuts land
+/// where a speaker would naturally pause; only a clause that is *still* longer
+/// than maxChars falls back to word-boundary splitting. Keeping the punctuation
+/// with its clause preserves the prosodic cue F5 renders the pause from.
 private func splitLongRun(_ sentence: String, maxChars: Int) -> [String] {
+    let clauses = splitIntoClauses(sentence)
     var out: [String] = []
     var current = ""
-    for word in sentence.split(separator: " ") {
+    func flush() {
+        let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { out.append(t) }
+        current = ""
+    }
+    for clause in clauses {
+        if clause.count > maxChars {
+            // Clause itself too long even after punctuation breaks — fall back
+            // to packing its words.
+            flush()
+            out.append(contentsOf: splitAtWords(clause, maxChars: maxChars))
+        } else if current.isEmpty {
+            current = clause
+        } else if current.count + 1 + clause.count <= maxChars {
+            current += " " + clause
+        } else {
+            flush()
+            current = clause
+        }
+    }
+    flush()
+    return out
+}
+
+/// Break a sentence at clause-level punctuation (, ; : — –), keeping the
+/// delimiter attached to the clause it closes. Returns the original sentence as
+/// a single element when it has no such punctuation.
+private func splitIntoClauses(_ sentence: String) -> [String] {
+    let breakers: Set<Character> = [",", ";", ":", "\u{2014}", "\u{2013}"]
+    var out: [String] = []
+    var current = ""
+    for ch in sentence {
+        current.append(ch)
+        if breakers.contains(ch) {
+            let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { out.append(t) }
+            current = ""
+        }
+    }
+    let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !tail.isEmpty { out.append(tail) }
+    return out.isEmpty ? [sentence] : out
+}
+
+/// Last-resort split of an over-long run into <=maxChars pieces at word
+/// boundaries (a single word longer than maxChars is left intact).
+private func splitAtWords(_ run: String, maxChars: Int) -> [String] {
+    var out: [String] = []
+    var current = ""
+    for word in run.split(separator: " ") {
         if current.isEmpty {
             current = String(word)
         } else if current.count + 1 + word.count <= maxChars {
@@ -182,7 +257,8 @@ func handleF5Clone(
     input: String,
     cloneRef: String,
     cloneRefText: String?,
-    responseFormat: String
+    responseFormat: String,
+    speed: Double = 1.0
 ) async throws -> Response {
     // Prefer an F5-specific reference pair when one sits next to the registry
     // ref. `f5_ref.wav` + `f5_ref.txt` (built by tts-bench/build_f5_refs.py) are
@@ -207,8 +283,14 @@ func handleF5Clone(
     let sampleRate = F5TTS.sampleRate
     let contentType = (responseFormat == "wav") ? "audio/wav" : "audio/pcm"
     let format = responseFormat
-    let chunks = chunkTextForF5(input, maxChars: F5MaxChunkChars)
+    // F5_MAX_CHUNK_CHARS<=0 disables chunking: hand the whole input to F5 in one
+    // pass (experiment knob — see the cps/native knobs below).
+    let maxChunk = F5MaxChunkChars
+    let chunks = maxChunk > 0 ? chunkTextForF5(input, maxChars: maxChunk) : [input]
     let gap = [Float](repeating: 0, count: Int(F5ChunkGapSeconds * Double(sampleRate)))
+    let cpsMin = F5CpsMin
+    let cpsMax = F5CpsMax
+    let durationNative = F5DurationNative
 
     return Response(
         status: .ok,
@@ -224,7 +306,11 @@ func handleF5Clone(
                     let out = try await model.generate(
                         text: chunk,
                         referenceAudio: refAudio,
-                        referenceAudioText: refText)
+                        referenceAudioText: refText,
+                        cpsMin: cpsMin,
+                        cpsMax: cpsMax,
+                        speed: speed,
+                        useNativeDuration: durationNative)
                     let samples = trimEdgeSilence(out.asArray(Float.self))
                     guard !samples.isEmpty else { continue }
                     // Clean silence between chunks (a natural pause) avoids the

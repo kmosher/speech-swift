@@ -81,6 +81,13 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         }
 
         let voiceRaw = (json["voice"] as? String) ?? ""
+        // OpenAI's `speed` (0.25–4.0, 1.0 = normal). Currently honored only by
+        // the F5 path, which multiplies its clamped chars/sec rate by it. Values
+        // are JSON numbers; accept Int or Double and clamp to the documented band.
+        let speed: Double = {
+            let raw = (json["speed"] as? Double) ?? (json["speed"] as? NSNumber)?.doubleValue ?? 1.0
+            return min(max(raw, 0.25), 4.0)
+        }()
         let responseFormat = ((json["response_format"] as? String) ?? "wav").lowercased()
         guard responseFormat == "wav" || responseFormat == "pcm" else {
             // OpenAI also documents mp3/opus/aac/flac. Synthesizing them would
@@ -150,7 +157,8 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
                 input: input,
                 cloneRef: cloneRef,
                 cloneRefText: cloneRefText,
-                responseFormat: responseFormat)
+                responseFormat: responseFormat,
+                speed: speed)
         }
 
         let registryEntry: VoiceEntry? = {
@@ -174,7 +182,8 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
                 input: input,
                 cloneRef: entry.refPath,
                 cloneRefText: entry.refText,
-                responseFormat: responseFormat)
+                responseFormat: responseFormat,
+                speed: speed)
         }
 
         return try await handleVoxCPM2Bare(

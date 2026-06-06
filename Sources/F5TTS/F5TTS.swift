@@ -267,6 +267,10 @@ public class F5TTS: Module {
         cfg: Double = 2.0,
         sway: Double = -1.0,
         seed: Int? = nil,
+        cpsMin: Double = 13.0,
+        cpsMax: Double = 18.0,
+        speed: Double = 1.0,
+        useNativeDuration: Bool = false,
         progressHandler: ((Double) -> Void)? = nil
     ) async throws -> MLXArray {
         let vocos = try await loadCachedVocos()
@@ -290,14 +294,27 @@ public class F5TTS: Module {
         let refFrames = referenceAudio.shape[0] / F5TTS.hopLength
         let refSeconds = Double(referenceAudio.shape[0]) / Double(F5TTS.sampleRate)
         let rawCharsPerSecond = Double(max(referenceAudioText.count, 1)) / max(refSeconds, 0.1)
-        let charsPerSecond = min(max(rawCharsPerSecond, 13.0), 18.0)
-        let genSeconds = Double(text.count) / charsPerSecond
+        // Clamp the reference-derived rate into a sane band FIRST, then apply
+        // `speed` as a deliberate multiplier on top. Higher chars/sec = fewer
+        // generated frames = faster speech, so `speed=1.5` shortens the span to
+        // ~2/3. Speed multiplies AFTER the clamp so it remains a true global
+        // lever even when it pushes the effective rate past the band (the band
+        // only bounds the *automatic* per-reference variation, not the caller's
+        // explicit request). Guard against a zero/negative speed.
+        let clampedCharsPerSecond = min(max(rawCharsPerSecond, cpsMin), cpsMax)
+        let effectiveCharsPerSecond = clampedCharsPerSecond * max(speed, 0.1)
+        let genSeconds = Double(text.count) / effectiveCharsPerSecond
         let totalFrames = refFrames + Int(genSeconds * F5TTS.framesPerSecond)
+
+        // `useNativeDuration` (experiment knob): hand `duration: nil` to let F5's
+        // duration_v2 predictor size the span instead of our clamped estimate.
+        // NOTE: `speed` has no effect in this mode — the predictor owns the span.
+        let durationFrames: Int? = useNativeDuration ? nil : totalFrames
 
         let (outputAudio, _) = try self.sample(
             cond: normalizedAudio.expandedDimensions(axis: 0),
             text: [processedText],
-            duration: totalFrames,
+            duration: durationFrames,
             steps: steps,
             method: method,
             cfgStrength: cfg,
