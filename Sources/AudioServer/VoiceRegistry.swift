@@ -4,10 +4,16 @@ import Foundation
 /// On-disk registry of pre-curated voice-clone references. The audio-server
 /// scans `~/.voicemode/voices/<id>/` (override via `VOICEMODE_VOICES_DIR`) at
 /// startup; each subdirectory must contain `ref.wav` and `ref.txt`. The id is
-/// the directory name. An optional empty `no_hash` file marks the voice as
+/// the directory name. An optional `no_hash` file marks the voice as
 /// "available via direct lookup only" — excluded from the `claude_<hex>` hash
 /// pool. Use this for voices you don't want Claude sessions randomly landing
-/// on (e.g. yourself), while still keeping them callable by id.
+/// on (e.g. yourself, or a clip that turned out scratchy/fuzzy), while still
+/// keeping them callable by id.
+///
+/// `no_hash`'s presence is what matters — its contents are never read by
+/// this loader — so by convention drop a freeform note in the file
+/// explaining why the voice was opted out (date + reason), e.g.:
+///   `2026-07-01: scratchy/fuzzy clone quality, excluded from announce pool`
 ///
 /// Two ways callers select a registry voice via the `voice` field on
 /// `/v1/audio/speech`:
