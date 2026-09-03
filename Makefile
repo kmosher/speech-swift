@@ -19,7 +19,12 @@ install:
 	@mkdir -p $(PREFIX)/bin $(PREFIX)/share/speech-swift
 	@cp -f .build/release/audio-server $(PREFIX)/bin/audio-server
 	@cp -f .build/release/speech-server $(PREFIX)/bin/speech-server 2>/dev/null || true
-	@cp -fL .build/arm64-apple-macosx/release/mlx.metallib $(PREFIX)/bin/mlx.metallib
+# The metallib is only rebuilt when the Metal toolchain is present, and the
+# built path may be a symlink that has gone dangling. Overwrite the installed
+# copy only from a real readable file — clobbering a working metallib with
+# nothing leaves a server that starts, answers /health, and dies at the first
+# inference with "Failed to load the default metallib".
+	@if [ -r .build/release/mlx.metallib ]; then 		cp -fL .build/release/mlx.metallib $(PREFIX)/bin/mlx.metallib; 		echo "installed mlx.metallib"; 	elif [ -f $(PREFIX)/bin/mlx.metallib ]; then 		echo "note: no freshly built mlx.metallib; keeping $(PREFIX)/bin/mlx.metallib"; 	else 		echo "error: no mlx.metallib here or in $(PREFIX)/bin — run 'make build' with the Metal toolchain installed" >&2; 		exit 1; 	fi
 	@echo "installed audio-server to $(PREFIX)/bin/"
 
 debug:

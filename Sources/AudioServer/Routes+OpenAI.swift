@@ -115,8 +115,7 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         // the VoxCPM2 engine (see resolveVariantModelId). The bare/no-voice path
         // uses VoxCPM2 (its "lucky dip" timbre is intentional; F5 has no bare mode).
         let voiceLower = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let useVoxCPM2 = voiceLower.hasPrefix("voxcpm2")
-        let useCosyVoice = voiceLower.hasPrefix("cosyvoice")
+        let engine = resolveTTSEngine(voice: voiceLower)
 
         // OpenAI's gpt-4o-mini-tts API uses `instructions` for natural-language
         // style control ("speak excitedly", "in a low whisper"). VoxCPM2 takes
@@ -149,28 +148,9 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         // would render its own default speaker, which is not a voice anything
         // on this machine asks for.
         if let cloneRef {
-            if useCosyVoice {
-                return try await handleCosyVoiceClone(
-                    input: input,
-                    cloneRef: cloneRef,
-                    responseFormat: responseFormat,
-                    modelId: nil)
-            }
-            if useVoxCPM2 {
-                return try await handleVoxCPM2Clone(
-                    input: input,
-                    cloneRef: cloneRef,
-                    cloneRefText: cloneRefText,
-                    responseFormat: responseFormat,
-                    instructions: instructions,
-                    modelId: modelId)
-            }
-            return try await handleF5Clone(
-                input: input,
-                cloneRef: cloneRef,
-                cloneRefText: cloneRefText,
-                responseFormat: responseFormat,
-                speed: speed)
+            return try await engine.clone(
+                input, cloneRef, engine.usesReferenceText ? cloneRefText : nil,
+                responseFormat, instructions, modelId, speed)
         }
 
         let registryEntry: VoiceEntry? = {
@@ -181,35 +161,16 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
             return voiceRegistry.lookup(id: voiceLower)
         }()
         if let entry = registryEntry {
-            if useCosyVoice {
-                return try await handleCosyVoiceClone(
-                    input: input,
-                    cloneRef: entry.refPath,
-                    responseFormat: responseFormat,
-                    modelId: nil)
-            }
-            if useVoxCPM2 {
-                return try await handleVoxCPM2Clone(
-                    input: input,
-                    cloneRef: entry.refPath,
-                    cloneRefText: entry.refText,
-                    responseFormat: responseFormat,
-                    instructions: instructions,
-                    modelId: modelId)
-            }
-            return try await handleF5Clone(
-                input: input,
-                cloneRef: entry.refPath,
-                cloneRefText: entry.refText,
-                responseFormat: responseFormat,
-                speed: speed)
+            return try await engine.clone(
+                input, entry.refPath, engine.usesReferenceText ? entry.refText : nil,
+                responseFormat, instructions, modelId, speed)
         }
 
-        return try await handleVoxCPM2Bare(
-            input: input,
-            responseFormat: responseFormat,
-            instructions: instructions,
-            modelId: modelId)
+        guard let fallback = bareTTSEngine(), let bare = fallback.bare else {
+            return errorResponse("No engine can render a voice without a reference",
+                                 status: .badRequest)
+        }
+        return try await bare(input, responseFormat, instructions, modelId)
     }
 }
 
@@ -276,7 +237,7 @@ enum CloneError: Error, LocalizedError {
 /// sentence we still wait for the full buffer before writing. Adding true
 /// intra-sentence streaming requires opening up the patch-decode loop in
 /// `VoxCPM2TTSModel`.
-private func handleVoxCPM2Clone(
+func handleVoxCPM2Clone(
     input: String,
     cloneRef: String,
     cloneRefText: String?,
@@ -347,7 +308,7 @@ private func handleVoxCPM2Clone(
 /// Sentences 2+ clone sentence 1, so the whole response shares one timbre.
 /// Across API calls the voice still varies — that's the intentional
 /// "lucky dip" character of bare VoxCPM2; we only lock within-call.
-private func handleVoxCPM2Bare(
+func handleVoxCPM2Bare(
     input: String,
     responseFormat: String,
     instructions: String?,

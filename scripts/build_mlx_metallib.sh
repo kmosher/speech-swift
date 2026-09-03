@@ -65,6 +65,36 @@ fi
 OUT_METALLIB="$OUT_DIR/mlx.metallib"
 HASH_FILE="$OUT_DIR/.mlx.metallib.sha"
 
+# A metallib left behind as a symlink into a Homebrew cellar goes dangling the
+# moment that formula is upgraded or removed. Every test below uses -f, which
+# is false for a dangling link, so the stale link would silently defeat both
+# the up-to-date check and the reuse path. Clear it first.
+if [[ -L "$OUT_METALLIB" && ! -e "$OUT_METALLIB" ]]; then
+  echo "removing dangling mlx.metallib symlink -> $(readlink "$OUT_METALLIB")"
+  rm -f "$OUT_METALLIB"
+fi
+
+# The Metal toolchain is a separate multi-gigabyte Xcode component and is not
+# present on every machine that needs to *build the server*. The shaders only
+# change when mlx-swift itself does, so an existing metallib stays valid across
+# ordinary Swift-side rebuilds — refusing to build at all would be a far worse
+# failure than reusing one.
+if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun metal --version >/dev/null 2>&1; then
+  if [[ -f "$OUT_METALLIB" ]]; then
+    echo "note: Metal toolchain unavailable; keeping existing $OUT_METALLIB"
+    exit 0
+  fi
+  INSTALLED="${PREFIX:-/opt/ai-tools}/bin/mlx.metallib"
+  if [[ -f "$INSTALLED" ]]; then
+    echo "note: Metal toolchain unavailable; reusing installed $INSTALLED"
+    cp -f "$INSTALLED" "$OUT_METALLIB"
+    exit 0
+  fi
+  echo "error: no mlx.metallib available and the Metal toolchain is missing" >&2
+  echo "hint: xcodebuild -downloadComponent MetalToolchain" >&2
+  exit 1
+fi
+
 # Content hash of all metal sources + headers to detect changes
 CURRENT_HASH="$(find "$KERNELS_DIR" -type f \( -name '*.metal' -o -name '*.h' \) ! -name '*_nax.metal' | LC_ALL=C sort | xargs cat | shasum -a 256 | awk '{print $1}')"
 
