@@ -21,7 +21,7 @@ import VoxCPM2TTS
 /// engine's native rate (VoxCPM2 is 48kHz) by resampling at the write
 /// boundary. Clients that want native quality should ask for `wav`, whose
 /// header carries the real sample rate.
-private let PCMWireSampleRate: Int = 24000
+let PCMWireSampleRate: Int = 24000
 
 /// Per-model variant cache. Lets clients select a VoxCPM2 size/precision via
 /// the OpenAI `model` field. Each variant is a couple of GB of MLX weights,
@@ -116,6 +116,7 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         // uses VoxCPM2 (its "lucky dip" timbre is intentional; F5 has no bare mode).
         let voiceLower = voiceRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let useVoxCPM2 = voiceLower.hasPrefix("voxcpm2")
+        let useCosyVoice = voiceLower.hasPrefix("cosyvoice")
 
         // OpenAI's gpt-4o-mini-tts API uses `instructions` for natural-language
         // style control ("speak excitedly", "in a low whisper"). VoxCPM2 takes
@@ -142,8 +143,19 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
         //        sorted registry. Same session id → same voice across restarts.
         //   3. `voice=voxcpm2` (or `voxcpm2:...`) → bare VoxCPM2 default speaker.
         //   4. Anything else → bare VoxCPM2 default speaker.
-        // Cloning paths (1 and 2) use F5 by default; `useVoxCPM2` opts back in.
+        // Cloning paths (1 and 2) use F5 by default; `voice=voxcpm2` or
+        // `voice=cosyvoice` alongside a clone_ref opts into those engines
+        // instead. CosyVoice has no bare mode here — without a reference it
+        // would render its own default speaker, which is not a voice anything
+        // on this machine asks for.
         if let cloneRef {
+            if useCosyVoice {
+                return try await handleCosyVoiceClone(
+                    input: input,
+                    cloneRef: cloneRef,
+                    responseFormat: responseFormat,
+                    modelId: nil)
+            }
             if useVoxCPM2 {
                 return try await handleVoxCPM2Clone(
                     input: input,
@@ -169,6 +181,13 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
             return voiceRegistry.lookup(id: voiceLower)
         }()
         if let entry = registryEntry {
+            if useCosyVoice {
+                return try await handleCosyVoiceClone(
+                    input: input,
+                    cloneRef: entry.refPath,
+                    responseFormat: responseFormat,
+                    modelId: nil)
+            }
             if useVoxCPM2 {
                 return try await handleVoxCPM2Clone(
                     input: input,
@@ -199,7 +218,7 @@ private func handleOpenAISpeech() -> @Sendable (Request, BasicRequestContext) as
 /// Cache of decoded reference audio keyed by source path/URL. VoxCPM2 still
 /// re-encodes the VAE features per call; only the audio decode + (when remote)
 /// the HTTP fetch are memoized here.
-private let refAudioCache = RefAudioCache()
+let refAudioCache = RefAudioCache()
 
 actor RefAudioCache {
     private var entries: [String: [Float]] = [:]

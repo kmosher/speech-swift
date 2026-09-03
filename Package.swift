@@ -409,6 +409,7 @@ let package = Package(
                 "ParakeetASR",
                 "VoxCPM2TTS",
                 "F5TTS",
+                "CosyVoiceTTS",
                 "AudioCommon",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "MLX", package: "mlx-swift"),
