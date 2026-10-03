@@ -6,21 +6,13 @@ CONFIG ?= release
 # copy below needs no sudo).
 PREFIX ?= /opt/ai-tools
 
-# Code signing. TCC keys a permission grant on the binary's *designated
-# requirement*. Ad-hoc signing has no certificate to anchor to, so that
-# requirement degrades to `cdhash H"..."` — a content hash — and every rebuild
-# is a different program to TCC, re-prompting for file access on each install.
-# Signing with a stable identity makes it `identifier "..." and certificate
-# root = H"..."`, which survives rebuilds and keeps the grant.
-#
-# The identity is the self-signed one tmvault creates (scripts live in that
-# repo); a distinct SIGN_IDENTIFIER keeps the two programs separate while
-# sharing the certificate. Signing is skipped with a warning when the identity
-# is absent, so this stays buildable on a machine that has never had it.
-SIGN_IDENTITY   ?= tmvault-signing
+# Code signing. Ad-hoc signatures change on every rebuild, so TCC would treat
+# each install as a new program and re-prompt for file and microphone access.
+# metawork's `dev-codesign` signs with the shared self-signed identity under
+# this program's own identifier, which survives rebuilds; it warns and leaves
+# the binaries ad-hoc when the identity was never created.
 SIGN_IDENTIFIER ?= dev.kmosher.speech-server
-SIGN_KEYCHAIN   ?= $(HOME)/Library/Keychains/tmvault-signing.keychain-db
-SIGN_PASS_FILE  ?= $(HOME)/.config/tmvault/signing-keychain.pass
+DEV_CODESIGN    ?= /opt/metawork/bin/dev-codesign
 
 build:
 	swift build -c release --disable-sandbox
@@ -46,12 +38,15 @@ install:
 
 # Sign in place, after the copy: signing then copying works, but any later
 # write to the file invalidates the signature, and `install` writes the
-# metallib alongside. `find-identity` is checked without -v because a
-# self-signed certificate reads as CSSMERR_TP_NOT_TRUSTED — codesign accepts
-# it regardless, and -v would filter out the only identity we have.
+# metallib alongside.
 sign-installed:
-	@if [ -f "$(SIGN_PASS_FILE)" ] && [ -f "$(SIGN_KEYCHAIN)" ]; then 		security unlock-keychain -p "$$(cat $(SIGN_PASS_FILE))" $(SIGN_KEYCHAIN) 2>/dev/null || true; 	fi
-	@if security find-identity -p codesigning 2>/dev/null | grep -q "$(SIGN_IDENTITY)"; then 		for bin in speech-server audio-server; do 			codesign --force --options runtime 				--identifier $(SIGN_IDENTIFIER) 				--sign $(SIGN_IDENTITY) --timestamp=none 				$(PREFIX)/bin/$$bin || exit 1; 		done; 		echo "signed as $(SIGN_IDENTIFIER) ($(SIGN_IDENTITY))"; 	else 		echo "warning: signing identity '$(SIGN_IDENTITY)' not found — installing ad-hoc."; 		echo "         TCC will re-prompt for file access after every install."; 	fi
+	@if [ -x "$(DEV_CODESIGN)" ]; then \
+		$(DEV_CODESIGN) sign --runtime --identifier $(SIGN_IDENTIFIER) \
+			$(PREFIX)/bin/speech-server $(PREFIX)/bin/audio-server; \
+	 else \
+		echo "warning: $(DEV_CODESIGN) not found — installing ad-hoc."; \
+		echo "         TCC will re-prompt for access after every install."; \
+	fi
 
 debug:
 	swift build -c debug --disable-sandbox
